@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math"
@@ -15,9 +16,19 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
+type Limit struct {
+	Coin string `json:"coin"`
+	Time string `json:"time"`
+}
+
+type LimitsStorage struct {
+	Limits []Limit `json:"limits"`
+}
+
 type Bot struct {
 	telegramBot   *tgbotapi.BotAPI
 	binanceClient *futures.Client
+	limitsFile    string
 }
 
 func NewBot(telegramToken, binanceAPIKey, binanceSecretKey string) (*Bot, error) {
@@ -38,6 +49,7 @@ func NewBot(telegramToken, binanceAPIKey, binanceSecretKey string) (*Bot, error)
 	return &Bot{
 		telegramBot:   bot,
 		binanceClient: binanceClient,
+		limitsFile:    "limits.json",
 	}, nil
 }
 
@@ -353,6 +365,245 @@ func (b *Bot) showTyping(chatID int64) {
 	}
 }
 
+// loadLimits загружает лимиты из JSON файла
+func (b *Bot) loadLimits() (*LimitsStorage, error) {
+	storage := &LimitsStorage{
+		Limits: make([]Limit, 0),
+	}
+
+	// Проверяем, существует ли файл
+	if _, err := os.Stat(b.limitsFile); os.IsNotExist(err) {
+		log.Printf("[DEBUG] Файл лимитов не существует, создаю новый")
+		return storage, nil
+	}
+
+	// Читаем файл
+	data, err := os.ReadFile(b.limitsFile)
+	if err != nil {
+		log.Printf("[WARN] Ошибка при чтении файла лимитов: %v", err)
+		return storage, nil
+	}
+
+	// Парсим JSON
+	if len(data) == 0 {
+		log.Printf("[DEBUG] Файл лимитов пуст")
+		return storage, nil
+	}
+
+	if err := json.Unmarshal(data, storage); err != nil {
+		log.Printf("[WARN] Ошибка при парсинге JSON лимитов: %v", err)
+		return storage, nil
+	}
+
+	log.Printf("[DEBUG] Загружено лимитов: %d", len(storage.Limits))
+	return storage, nil
+}
+
+// saveLimits сохраняет лимиты в JSON файл
+func (b *Bot) saveLimits(storage *LimitsStorage) error {
+	data, err := json.MarshalIndent(storage, "", "  ")
+	if err != nil {
+		return fmt.Errorf("ошибка при сериализации лимитов: %w", err)
+	}
+
+	if err := os.WriteFile(b.limitsFile, data, 0644); err != nil {
+		return fmt.Errorf("ошибка при записи файла лимитов: %w", err)
+	}
+
+	log.Printf("[DEBUG] Сохранено лимитов: %d", len(storage.Limits))
+	return nil
+}
+
+// parseTime парсит строку времени в формате "12h", "30m", "1d" и т.д.
+func parseTime(timeStr string) (time.Duration, error) {
+	timeStr = strings.TrimSpace(timeStr)
+	if len(timeStr) == 0 {
+		return 0, fmt.Errorf("пустая строка времени")
+	}
+
+	// Определяем единицу измерения (последний символ)
+	unit := timeStr[len(timeStr)-1:]
+	valueStr := timeStr[:len(timeStr)-1]
+
+	// Парсим числовое значение
+	value, err := strconv.ParseFloat(valueStr, 64)
+	if err != nil {
+		return 0, fmt.Errorf("неверный формат числа: %s", valueStr)
+	}
+
+	// Преобразуем в Duration в зависимости от единицы
+	var duration time.Duration
+	switch strings.ToLower(unit) {
+	case "s", "S":
+		duration = time.Duration(value) * time.Second
+	case "m", "M":
+		duration = time.Duration(value) * time.Minute
+	case "h", "H":
+		duration = time.Duration(value) * time.Hour
+	case "d", "D":
+		duration = time.Duration(value) * 24 * time.Hour
+	default:
+		return 0, fmt.Errorf("неизвестная единица времени: %s (используйте s, m, h или d)", unit)
+	}
+
+	if duration <= 0 {
+		return 0, fmt.Errorf("время должно быть больше нуля")
+	}
+
+	return duration, nil
+}
+
+// handleAddLimitCommand обрабатывает команду /add_limit
+func (b *Bot) handleAddLimitCommand(update tgbotapi.Update) {
+	log.Printf("[INFO] Получена команда /add_limit от пользователя %d (chat ID: %d)",
+		update.Message.From.ID, update.Message.Chat.ID)
+
+	// Получаем аргументы команды
+	args := update.Message.CommandArguments()
+	parts := strings.Fields(args)
+
+	if len(parts) < 2 {
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+			"❌ Неверный формат команды.\n\n"+
+				"Использование: /add_limit <coin> <time>\n\n"+
+				"Примеры:\n"+
+				"/add_limit LSK 12h\n"+
+				"/add_limit BTC 30m\n"+
+				"/add_limit ETH 1d\n\n"+
+				"Единицы времени: s (секунды), m (минуты), h (часы), d (дни)")
+		b.telegramBot.Send(msg)
+		return
+	}
+
+	coin := strings.ToUpper(strings.TrimSpace(parts[0]))
+	timeStr := strings.TrimSpace(parts[1])
+
+	// Парсим время
+	duration, err := parseTime(timeStr)
+	if err != nil {
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+			fmt.Sprintf("❌ Ошибка при парсинге времени: %s\n\n"+
+				"Используйте формат: число + единица (s, m, h, d)\n"+
+				"Примеры: 12h, 30m, 1d", err.Error()))
+		b.telegramBot.Send(msg)
+		return
+	}
+
+	// Загружаем существующие лимиты
+	storage, err := b.loadLimits()
+	if err != nil {
+		log.Printf("[ERROR] Ошибка при загрузке лимитов: %v", err)
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+			"❌ Ошибка при загрузке лимитов. Попробуйте позже.")
+		b.telegramBot.Send(msg)
+		return
+	}
+
+	// Проверяем, существует ли уже лимит для этой монеты
+	for i, limit := range storage.Limits {
+		if strings.ToUpper(limit.Coin) == coin {
+			// Обновляем существующий лимит
+			storage.Limits[i].Time = timeStr
+			log.Printf("[DEBUG] Обновлен лимит для %s: %s", coin, timeStr)
+			
+			if err := b.saveLimits(storage); err != nil {
+				log.Printf("[ERROR] Ошибка при сохранении лимитов: %v", err)
+				msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+					"❌ Ошибка при сохранении лимитов. Попробуйте позже.")
+				b.telegramBot.Send(msg)
+				return
+			}
+
+			msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+				fmt.Sprintf("✅ Лимит для %s обновлен: %s (%.0f минут)",
+					coin, timeStr, duration.Minutes()))
+			b.telegramBot.Send(msg)
+			return
+		}
+	}
+
+	// Добавляем новый лимит
+	newLimit := Limit{
+		Coin: coin,
+		Time: timeStr,
+	}
+	storage.Limits = append(storage.Limits, newLimit)
+
+	// Сохраняем лимиты
+	if err := b.saveLimits(storage); err != nil {
+		log.Printf("[ERROR] Ошибка при сохранении лимитов: %v", err)
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+			"❌ Ошибка при сохранении лимитов. Попробуйте позже.")
+		b.telegramBot.Send(msg)
+		return
+	}
+
+	log.Printf("[INFO] Добавлен новый лимит: %s - %s", coin, timeStr)
+	msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+		fmt.Sprintf("✅ Лимит добавлен:\n\n"+
+			"Монета: %s\n"+
+			"Время: %s (%.0f минут)",
+			coin, timeStr, duration.Minutes()))
+	b.telegramBot.Send(msg)
+}
+
+// handleLimitsCommand обрабатывает команду /limits
+func (b *Bot) handleLimitsCommand(update tgbotapi.Update) {
+	log.Printf("[INFO] Получена команда /limits от пользователя %d (chat ID: %d)",
+		update.Message.From.ID, update.Message.Chat.ID)
+
+	// Загружаем лимиты
+	storage, err := b.loadLimits()
+	if err != nil {
+		log.Printf("[ERROR] Ошибка при загрузке лимитов: %v", err)
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+			"❌ Ошибка при загрузке лимитов. Попробуйте позже.")
+		b.telegramBot.Send(msg)
+		return
+	}
+
+	// Проверяем, есть ли лимиты
+	if len(storage.Limits) == 0 {
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+			"📋 Установленных лимитов нет.\n\n"+
+				"Используйте команду /add_limit для добавления лимитов.\n\n"+
+				"Пример: /add_limit LSK 12h")
+		b.telegramBot.Send(msg)
+		return
+	}
+
+	// Формируем сообщение со списком лимитов
+	message := "📋 Установленные лимиты:\n\n"
+	
+	for i, limit := range storage.Limits {
+		// Парсим время для отображения в минутах
+		duration, err := parseTime(limit.Time)
+		var timeDisplay string
+		if err != nil {
+			timeDisplay = limit.Time
+		} else {
+			minutes := duration.Minutes()
+			if minutes < 60 {
+				timeDisplay = fmt.Sprintf("%s (%.0f мин)", limit.Time, minutes)
+			} else if minutes < 1440 {
+				hours := minutes / 60
+				timeDisplay = fmt.Sprintf("%s (%.1f ч)", limit.Time, hours)
+			} else {
+				days := minutes / 1440
+				timeDisplay = fmt.Sprintf("%s (%.1f дн)", limit.Time, days)
+			}
+		}
+		
+		message += fmt.Sprintf("%d. %s - %s\n", i+1, limit.Coin, timeDisplay)
+	}
+
+	message += "\n💡 Используйте /add_limit для добавления или изменения лимитов."
+
+	// Отправляем сообщение
+	msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+	b.telegramBot.Send(msg)
+}
+
 func (b *Bot) handlePositionsCommand(update tgbotapi.Update) {
 	log.Printf("[INFO] Получена команда /positions от пользователя %d (chat ID: %d)", 
 		update.Message.From.ID, update.Message.Chat.ID)
@@ -438,7 +689,10 @@ func (b *Bot) Start() {
 				log.Printf("[DEBUG] Обрабатываю команду /start")
 				msg := tgbotapi.NewMessage(update.Message.Chat.ID, 
 					"Привет! Я бот для отслеживания открытых позиций на Binance Futures.\n\n"+
-					"Используйте команду /positions для просмотра открытых позиций.")
+					"Доступные команды:\n"+
+					"/positions - просмотр открытых позиций\n"+
+					"/add_limit - добавление лимитов\n"+
+					"/limits - просмотр установленных лимитов")
 				sentMsg, err := b.telegramBot.Send(msg)
 				if err != nil {
 					log.Printf("[ERROR] Ошибка при отправке ответа на /start: %v", err)
@@ -448,10 +702,19 @@ func (b *Bot) Start() {
 			case "positions":
 				log.Printf("[DEBUG] Обрабатываю команду /positions")
 				b.handlePositionsCommand(update)
+			case "add_limit":
+				log.Printf("[DEBUG] Обрабатываю команду /add_limit")
+				b.handleAddLimitCommand(update)
+			case "limits":
+				log.Printf("[DEBUG] Обрабатываю команду /limits")
+				b.handleLimitsCommand(update)
 			default:
 				log.Printf("[DEBUG] Неизвестная команда: /%s", command)
 				msg := tgbotapi.NewMessage(update.Message.Chat.ID, 
-					"Неизвестная команда. Используйте /positions для просмотра позиций.")
+					"Неизвестная команда. Используйте:\n"+
+					"/positions - для просмотра позиций\n"+
+					"/add_limit - для добавления лимитов\n"+
+					"/limits - для просмотра установленных лимитов")
 				sentMsg, err := b.telegramBot.Send(msg)
 				if err != nil {
 					log.Printf("[ERROR] Ошибка при отправке ответа на неизвестную команду: %v", err)

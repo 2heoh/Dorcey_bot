@@ -25,6 +25,9 @@ go.work
 binance-bot
 dorcey
 
+# Limits storage
+limits.json
+
 # IDE
 .idea/
 .vscode/
