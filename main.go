@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/adshao/go-binance/v2/common"
@@ -87,13 +90,60 @@ func (b *Bot) getOpenPositions() ([]*futures.PositionRisk, error) {
 	// Фильтруем только открытые позиции (positionAmt != 0)
 	var openPositions []*futures.PositionRisk
 	for _, pos := range positions {
-		if pos.PositionAmt != "0" && pos.PositionAmt != "0.0" {
+		// Нормализуем строку (убираем пробелы)
+		positionAmtStr := strings.TrimSpace(pos.PositionAmt)
+		
+		// Быстрая проверка строки: если пустая или начинается с "0" (но не "0.") - пропускаем
+		if positionAmtStr == "" {
+			continue
+		}
+		
+		// Убираем знак минус для проверки
+		checkStr := strings.TrimPrefix(positionAmtStr, "-")
+		checkStr = strings.TrimPrefix(checkStr, "+")
+		
+		// Проверяем, не является ли строка нулем в различных форматах
+		if checkStr == "0" || checkStr == "0.0" || checkStr == "0.00" || checkStr == "0.000" || 
+		   checkStr == "0.0000" || checkStr == "0.00000" || checkStr == "0.000000" ||
+		   checkStr == "0.0000000" || checkStr == "0.00000000" {
+			log.Printf("[DEBUG] Пропущена закрытая позиция (строка): %s, размер: %s", pos.Symbol, positionAmtStr)
+			continue
+		}
+		
+		// Парсим размер позиции как число для точной проверки
+		positionAmt, err := strconv.ParseFloat(positionAmtStr, 64)
+		if err != nil {
+			log.Printf("[WARN] Не удалось распарсить размер позиции для %s: %s, ошибка: %v", pos.Symbol, positionAmtStr, err)
+			continue
+		}
+		
+		// Позиция считается открытой, если её абсолютное значение больше очень маленького числа (epsilon)
+		// Это позволяет избежать проблем с точностью float
+		const epsilon = 1e-10
+		absPositionAmt := math.Abs(positionAmt)
+		
+		// Дополнительная проверка: цена входа должна быть больше нуля
+		entryPriceStr := strings.TrimSpace(pos.EntryPrice)
+		entryPrice, err2 := strconv.ParseFloat(entryPriceStr, 64)
+		if err2 != nil {
+			log.Printf("[DEBUG] ✗ Пропущена позиция (неверная цена входа): %s, размер: %s, цена входа: %s", 
+				pos.Symbol, positionAmtStr, entryPriceStr)
+			continue
+		}
+		
+		// Позиция считается открытой только если:
+		// 1. Размер позиции не равен нулю (с учетом погрешности)
+		// 2. Цена входа больше нуля (позиция действительно была открыта)
+		if absPositionAmt > epsilon && entryPrice > epsilon {
 			openPositions = append(openPositions, pos)
-			log.Printf("[DEBUG] Найдена открытая позиция: %s, размер: %s", pos.Symbol, pos.PositionAmt)
+			log.Printf("[DEBUG] ✓ Открытая позиция: %s, размер: %s, цена входа: %s", pos.Symbol, positionAmtStr, entryPriceStr)
+		} else {
+			log.Printf("[DEBUG] ✗ Пропущена закрытая позиция: %s, размер: %s (%.10f), цена входа: %s (%.10f)", 
+				pos.Symbol, positionAmtStr, positionAmt, entryPriceStr, entryPrice)
 		}
 	}
 
-	log.Printf("[DEBUG] Отфильтровано открытых позиций: %d", len(openPositions))
+	log.Printf("[DEBUG] ===== ИТОГО: Отфильтровано открытых позиций: %d из %d =====", len(openPositions), len(positions))
 	return openPositions, nil
 }
 
@@ -172,10 +222,23 @@ func (b *Bot) formatPositionsMessage(positions []*futures.PositionRisk) string {
 		message += fmt.Sprintf("%d. %s %s\n", i+1, pos.Symbol, side)
 		message += fmt.Sprintf("   Размер: %s\n", pos.PositionAmt)
 		message += fmt.Sprintf("   Цена входа: %s\n", pos.EntryPrice)
-		if pos.IsolatedMargin != "" && pos.IsolatedMargin != "0" {
-			message += fmt.Sprintf("   Маржа: %s\n", pos.IsolatedMargin)
+		
+		// Проверяем маржу (может быть IsolatedMargin или Notional)
+		margin := pos.IsolatedMargin
+		if margin == "" || margin == "0" || margin == "0.0" {
+			margin = pos.Notional
 		}
-		message += fmt.Sprintf("   PnL: %s\n", pos.UnRealizedProfit)
+		if margin != "" && margin != "0" && margin != "0.0" {
+			message += fmt.Sprintf("   Маржа: %s\n", margin)
+		}
+		
+		// Отображаем PnL только если он не равен нулю
+		if pos.UnRealizedProfit != "" && pos.UnRealizedProfit != "0" && pos.UnRealizedProfit != "0.0" {
+			message += fmt.Sprintf("   PnL: %s\n", pos.UnRealizedProfit)
+		} else {
+			message += fmt.Sprintf("   PnL: 0.00\n")
+		}
+		
 		message += fmt.Sprintf("   Время сделки: %s назад\n\n", timeStr)
 	}
 
