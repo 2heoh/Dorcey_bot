@@ -173,15 +173,112 @@ func (b *Bot) formatPositionTime(updateTime int64) string {
 	return fmt.Sprintf("%d ч %d мин", hours, minutes)
 }
 
-func (b *Bot) getPositionOpenTime(symbol string) (int64, error) {
+// calculatePositionOpenTime вычисляет время открытия текущей позиции по списку ордеров
+// Отслеживает баланс позиции и находит момент последнего открытия
+// (когда позиция перешла из 0 или противоположного направления в текущее)
+// isLong: true для LONG позиции, false для SHORT
+func calculatePositionOpenTime(orders []*futures.Order, isLong bool) int64 {
+	if len(orders) == 0 {
+		return 0
+	}
+
+	// Сортируем ордера по времени (от старых к новым)
+	sortedOrders := make([]*futures.Order, len(orders))
+	copy(sortedOrders, orders)
+	for i := 0; i < len(sortedOrders)-1; i++ {
+		for j := i + 1; j < len(sortedOrders); j++ {
+			timeI := sortedOrders[i].Time
+			if timeI == 0 {
+				timeI = sortedOrders[i].UpdateTime
+			}
+			timeJ := sortedOrders[j].Time
+			if timeJ == 0 {
+				timeJ = sortedOrders[j].UpdateTime
+			}
+			if timeI > timeJ {
+				sortedOrders[i], sortedOrders[j] = sortedOrders[j], sortedOrders[i]
+			}
+		}
+	}
+
+	// Отслеживаем баланс позиции
+	// Положительный баланс = LONG, отрицательный = SHORT
+	var positionBalance float64 = 0
+	var lastOpenTime int64 = 0
+
+	for _, order := range sortedOrders {
+		if order.Status != futures.OrderStatusTypeFilled {
+			continue
+		}
+
+		// Парсим количество исполненного ордера
+		executedQty, err := strconv.ParseFloat(order.ExecutedQuantity, 64)
+		if err != nil {
+			continue
+		}
+
+		orderTime := order.Time
+		if orderTime == 0 {
+			orderTime = order.UpdateTime
+		}
+
+		prevBalance := positionBalance
+
+		// BUY увеличивает позицию, SELL уменьшает
+		if order.Side == futures.SideTypeBuy {
+			positionBalance += executedQty
+		} else {
+			positionBalance -= executedQty
+		}
+
+		// Определяем направление позиции до и после ордера
+		wasLong := prevBalance > 0.0000001  // Небольшой порог для float сравнения
+		wasShort := prevBalance < -0.0000001
+		wasZero := !wasLong && !wasShort
+
+		nowLong := positionBalance > 0.0000001
+		nowShort := positionBalance < -0.0000001
+
+		// Позиция открылась, если:
+		// 1. Была нулевой и стала ненулевой в нужном направлении
+		// 2. Была в противоположном направлении и стала в нужном
+		positionOpened := false
+		if isLong {
+			positionOpened = nowLong && (wasZero || wasShort)
+		} else {
+			positionOpened = nowShort && (wasZero || wasLong)
+		}
+
+		if positionOpened {
+			lastOpenTime = orderTime
+		}
+	}
+
+	if lastOpenTime > 0 {
+		return lastOpenTime
+	}
+
+	// Если не нашли момент открытия, используем время самого старого ордера
+	if len(sortedOrders) > 0 {
+		oldestTime := sortedOrders[0].Time
+		if oldestTime == 0 {
+			oldestTime = sortedOrders[0].UpdateTime
+		}
+		return oldestTime
+	}
+
+	return 0
+}
+
+// getPositionOpenTime получает время открытия текущей позиции
+// isLong: true для LONG позиции, false для SHORT
+func (b *Bot) getPositionOpenTime(symbol string, isLong bool) (int64, error) {
 	ctx := context.Background()
 
-	// Получаем историю ордеров для определения времени открытия позиции
-	// Используем последний выполненный ордер как приблизительное время открытия
-	log.Printf("[DEBUG] Получаю время открытия позиции для %s...", symbol)
+	log.Printf("[DEBUG] Получаю время открытия позиции для %s (направление: %v)...", symbol, isLong)
 	orders, err := b.binanceClient.NewListOrdersService().
 		Symbol(symbol).
-		Limit(10).
+		Limit(1000).
 		Do(ctx)
 
 	if err != nil {
@@ -194,33 +291,38 @@ func (b *Bot) getPositionOpenTime(symbol string) (int64, error) {
 		return time.Now().UnixMilli(), nil
 	}
 
-	// Находим последний выполненный ордер (FILLED)
-	var lastFilledTime int64 = 0
+	openTime := calculatePositionOpenTime(orders, isLong)
+	if openTime == 0 {
+		return time.Now().UnixMilli(), nil
+	}
+
+	log.Printf("[DEBUG] Найдено время открытия для %s: %d", symbol, openTime)
+	return openTime, nil
+	}
+
+// calculateFilledOrdersCount подсчитывает исполненные ордера после времени открытия позиции
+func calculateFilledOrdersCount(orders []*futures.Order, positionOpenTime int64) int {
+	filledCount := 0
 	for _, order := range orders {
-		if order.Status == futures.OrderStatusTypeFilled && order.UpdateTime > lastFilledTime {
-			lastFilledTime = order.UpdateTime
+		if order.Status == futures.OrderStatusTypeFilled {
+			orderTime := order.Time
+			if orderTime == 0 {
+				orderTime = order.UpdateTime
+			}
+			if orderTime >= positionOpenTime {
+				filledCount++
+			}
 		}
 	}
-
-	if lastFilledTime > 0 {
-		log.Printf("[DEBUG] Найдено время открытия для %s: %d", symbol, lastFilledTime)
-		return lastFilledTime, nil
-	}
-
-	// Если нет выполненных ордеров, используем время последнего обновления
-	if len(orders) > 0 {
-		log.Printf("[DEBUG] Использую время последнего обновления для %s: %d", symbol, orders[0].UpdateTime)
-		return orders[0].UpdateTime, nil
-	}
-
-	return time.Now().UnixMilli(), nil
+	return filledCount
 }
 
 // getFilledOrdersCount получает количество исполненных ордеров для символа
-func (b *Bot) getFilledOrdersCount(symbol string) (int, error) {
+// учитывая только ордера, открытые после времени открытия позиции
+func (b *Bot) getFilledOrdersCount(symbol string, positionOpenTime int64) (int, error) {
 	ctx := context.Background()
 
-	log.Printf("[DEBUG] Получаю количество исполненных ордеров для %s...", symbol)
+	log.Printf("[DEBUG] Получаю количество исполненных ордеров для %s (после времени открытия: %d)...", symbol, positionOpenTime)
 	
 	// Получаем все ордера (максимум 1000 для Binance Futures API)
 	orders, err := b.binanceClient.NewListOrdersService().
@@ -233,15 +335,8 @@ func (b *Bot) getFilledOrdersCount(symbol string) (int, error) {
 		return 0, err
 	}
 
-	// Подсчитываем только исполненные ордера (FILLED)
-	filledCount := 0
-	for _, order := range orders {
-		if order.Status == futures.OrderStatusTypeFilled {
-			filledCount++
-		}
-	}
-
-	log.Printf("[DEBUG] Найдено исполненных ордеров для %s: %d из %d", symbol, filledCount, len(orders))
+	filledCount := calculateFilledOrdersCount(orders, positionOpenTime)
+	log.Printf("[DEBUG] Найдено исполненных ордеров для %s (после открытия позиции): %d из %d", symbol, filledCount, len(orders))
 	return filledCount, nil
 }
 
@@ -255,12 +350,17 @@ func (b *Bot) formatPositionsMessage(positions []*futures.PositionRisk) string {
 
 	for i, pos := range positions {
 		log.Printf("[DEBUG] Обрабатываю позицию %d/%d: %s", i+1, len(positions), pos.Symbol)
+		// Определяем направление позиции
+		isLong := true
+		if len(pos.PositionAmt) > 0 && pos.PositionAmt[0] == '-' {
+			isLong = false
+		}
 		// Получаем время открытия позиции
-		openTime, _ := b.getPositionOpenTime(pos.Symbol)
+		openTime, _ := b.getPositionOpenTime(pos.Symbol, isLong)
 		timeStr := b.formatPositionTime(openTime)
 
-		// Получаем количество исполненных ордеров
-		filledOrdersCount, err := b.getFilledOrdersCount(pos.Symbol)
+		// Получаем количество исполненных ордеров (только после времени открытия позиции)
+		filledOrdersCount, err := b.getFilledOrdersCount(pos.Symbol, openTime)
 		if err != nil {
 			log.Printf("[WARN] Не удалось получить количество исполненных ордеров для %s: %v", pos.Symbol, err)
 			filledOrdersCount = 0
@@ -807,8 +907,14 @@ func (b *Bot) checkPositionsForLimits() {
 			continue
 		}
 
+		// Определяем направление позиции
+		isLong := true
+		if len(pos.PositionAmt) > 0 && pos.PositionAmt[0] == '-' {
+			isLong = false
+		}
+
 		// Получаем время открытия позиции
-		openTime, err := b.getPositionOpenTime(symbol)
+		openTime, err := b.getPositionOpenTime(symbol, isLong)
 		if err != nil {
 			log.Printf("[WARN] Не удалось получить время открытия для %s: %v", symbol, err)
 			continue
@@ -868,16 +974,19 @@ func (b *Bot) sendLimitExceededNotifications(positions []*futures.PositionRisk, 
 			}
 		}
 
+		// Определяем направление позиции
+		side := "LONG"
+		isLong := true
+		if len(pos.PositionAmt) > 0 && pos.PositionAmt[0] == '-' {
+			side = "SHORT"
+			isLong = false
+		}
+
 		// Получаем время открытия и вычисляем возраст
-		openTime, _ := b.getPositionOpenTime(symbol)
+		openTime, _ := b.getPositionOpenTime(symbol, isLong)
 		now := time.Now().UnixMilli()
 		positionAge := time.Duration(now-openTime) * time.Millisecond
 		ageStr := b.formatPositionTime(openTime)
-
-		side := "LONG"
-		if len(pos.PositionAmt) > 0 && pos.PositionAmt[0] == '-' {
-			side = "SHORT"
-		}
 
 		message += fmt.Sprintf("🔴 <b>%s %s</b>\n", symbol, side)
 		message += fmt.Sprintf("   Размер: %s\n", pos.PositionAmt)
