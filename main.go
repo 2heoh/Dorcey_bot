@@ -239,15 +239,6 @@ func (b *Bot) formatPositionsMessage(positions []*futures.PositionRisk) string {
 		message += fmt.Sprintf("   Размер: %s\n", pos.PositionAmt)
 		message += fmt.Sprintf("   Цена входа: %s\n", pos.EntryPrice)
 
-		// Проверяем маржу (может быть IsolatedMargin или Notional)
-		margin := pos.IsolatedMargin
-		if margin == "" || margin == "0" || margin == "0.0" {
-			margin = pos.Notional
-		}
-		if margin != "" && margin != "0" && margin != "0.0" {
-			message += fmt.Sprintf("   Маржа: %s\n", margin)
-		}
-
 		// Отображаем PnL только если он не равен нулю
 		if pos.UnRealizedProfit != "" && pos.UnRealizedProfit != "0" && pos.UnRealizedProfit != "0.0" {
 			message += fmt.Sprintf("   PnL: %s\n", pos.UnRealizedProfit)
