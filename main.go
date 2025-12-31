@@ -216,6 +216,35 @@ func (b *Bot) getPositionOpenTime(symbol string) (int64, error) {
 	return time.Now().UnixMilli(), nil
 }
 
+// getFilledOrdersCount получает количество исполненных ордеров для символа
+func (b *Bot) getFilledOrdersCount(symbol string) (int, error) {
+	ctx := context.Background()
+
+	log.Printf("[DEBUG] Получаю количество исполненных ордеров для %s...", symbol)
+	
+	// Получаем все ордера (максимум 1000 для Binance Futures API)
+	orders, err := b.binanceClient.NewListOrdersService().
+		Symbol(symbol).
+		Limit(1000). // Максимальный лимит для Binance Futures API
+		Do(ctx)
+
+	if err != nil {
+		log.Printf("[WARN] Не удалось получить ордера для %s: %v", symbol, err)
+		return 0, err
+	}
+
+	// Подсчитываем только исполненные ордера (FILLED)
+	filledCount := 0
+	for _, order := range orders {
+		if order.Status == futures.OrderStatusTypeFilled {
+			filledCount++
+		}
+	}
+
+	log.Printf("[DEBUG] Найдено исполненных ордеров для %s: %d из %d", symbol, filledCount, len(orders))
+	return filledCount, nil
+}
+
 func (b *Bot) formatPositionsMessage(positions []*futures.PositionRisk) string {
 	log.Printf("[DEBUG] Форматирую сообщение для %d позиций", len(positions))
 	if len(positions) == 0 {
@@ -229,6 +258,13 @@ func (b *Bot) formatPositionsMessage(positions []*futures.PositionRisk) string {
 		// Получаем время открытия позиции
 		openTime, _ := b.getPositionOpenTime(pos.Symbol)
 		timeStr := b.formatPositionTime(openTime)
+
+		// Получаем количество исполненных ордеров
+		filledOrdersCount, err := b.getFilledOrdersCount(pos.Symbol)
+		if err != nil {
+			log.Printf("[WARN] Не удалось получить количество исполненных ордеров для %s: %v", pos.Symbol, err)
+			filledOrdersCount = 0
+		}
 
 		side := "LONG"
 		if len(pos.PositionAmt) > 0 && pos.PositionAmt[0] == '-' {
@@ -246,6 +282,7 @@ func (b *Bot) formatPositionsMessage(positions []*futures.PositionRisk) string {
 			message += fmt.Sprintf("   PnL: 0.00\n")
 		}
 
+		message += fmt.Sprintf("   Исполненных ордеров: %d\n", filledOrdersCount)
 		message += fmt.Sprintf("   Время сделки: %s назад\n\n", timeStr)
 	}
 
@@ -354,8 +391,17 @@ func (b *Bot) sendLongMessage(chatID int64, message string, parseMode string) er
 // showTyping показывает пользователю, что бот печатает сообщение
 func (b *Bot) showTyping(chatID int64) {
 	action := tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping)
+	// Для ChatAction Telegram API возвращает true (boolean), а не Message
+	// Игнорируем ошибку парсинга, так как ChatAction успешно отправляется
 	_, err := b.telegramBot.Send(action)
 	if err != nil {
+		// Проверяем, не связана ли ошибка с парсингом bool в Message
+		// Если да, то игнорируем её, так как ChatAction успешно отправлен
+		errStr := err.Error()
+		if strings.Contains(errStr, "cannot unmarshal bool") || strings.Contains(errStr, "unmarshal") {
+			// Ошибка парсинга, но ChatAction успешно отправлен - игнорируем
+			return
+		}
 		log.Printf("[WARN] Не удалось отправить действие 'печатает': %v", err)
 	}
 }
@@ -904,7 +950,7 @@ func (b *Bot) startPositionChecker() {
 }
 
 func (b *Bot) handlePositionsCommand(update tgbotapi.Update) {
-	log.Printf("[INFO] Получена команда /positions от пользователя %d (chat ID: %d)",
+	log.Printf("[INFO] Получена команда /positions или /ps от пользователя %d (chat ID: %d)",
 		update.Message.From.ID, update.Message.Chat.ID)
 
 	// Показываем, что бот печатает
@@ -998,7 +1044,7 @@ func (b *Bot) Start() {
 				msg := tgbotapi.NewMessage(update.Message.Chat.ID,
 					"Привет! Я бот для отслеживания открытых позиций на Binance Futures.\n\n"+
 						"Доступные команды:\n"+
-						"/positions - просмотр открытых позиций\n"+
+						"/positions или /ps - просмотр открытых позиций\n"+
 						"/add_limit - добавление лимитов\n"+
 						"/limits - просмотр установленных лимитов\n"+
 						"/set_check_interval - установка интервала проверки позиций")
@@ -1008,8 +1054,8 @@ func (b *Bot) Start() {
 				} else {
 					log.Printf("[DEBUG] Ответ на /start отправлен (message ID: %d)", sentMsg.MessageID)
 				}
-			case "positions":
-				log.Printf("[DEBUG] Обрабатываю команду /positions")
+			case "positions", "ps":
+				log.Printf("[DEBUG] Обрабатываю команду /%s", command)
 				b.handlePositionsCommand(update)
 			case "add_limit":
 				log.Printf("[DEBUG] Обрабатываю команду /add_limit")
@@ -1024,7 +1070,7 @@ func (b *Bot) Start() {
 				log.Printf("[DEBUG] Неизвестная команда: /%s", command)
 				msg := tgbotapi.NewMessage(update.Message.Chat.ID,
 					"Неизвестная команда. Используйте:\n"+
-						"/positions - для просмотра позиций\n"+
+						"/positions или /ps - для просмотра позиций\n"+
 						"/add_limit - для добавления лимитов\n"+
 						"/limits - для просмотра установленных лимитов\n"+
 						"/set_check_interval - для установки интервала проверки")
