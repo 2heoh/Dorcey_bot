@@ -382,17 +382,31 @@ func (b *Bot) formatPositionsMessage(positions []*futures.PositionRisk) string {
 		}
 
 		message += fmt.Sprintf("%d. %s %s\n", i+1, pos.Symbol, side)
-		message += fmt.Sprintf("   Размер: %s\n", pos.PositionAmt)
+
+		// Парсим значения для расчётов
+		entryPrice, entryErr := strconv.ParseFloat(pos.EntryPrice, 64)
+		positionAmt, posErr := strconv.ParseFloat(pos.PositionAmt, 64)
+
+		// Размер позиции с номиналом в USDT
+		if entryErr == nil && posErr == nil && entryPrice != 0 {
+			notionalValue := math.Abs(positionAmt) * entryPrice
+			message += fmt.Sprintf("   Размер: %s (%.2f USDT)\n", pos.PositionAmt, notionalValue)
+		} else {
+			message += fmt.Sprintf("   Размер: %s\n", pos.PositionAmt)
+		}
 		message += fmt.Sprintf("   Цена входа: %s\n", pos.EntryPrice)
 
-		// Отображаем PnL с процентом просадки (ROE%)
+		// Отображаем PnL с процентом изменения цены (как на Veles Finance)
+		// Формула: percent = (currentPrice - entryPrice) / entryPrice * 100
 		if pos.UnRealizedProfit != "" && pos.UnRealizedProfit != "0" && pos.UnRealizedProfit != "0.0" {
-			// Вычисляем ROE% = (UnRealizedProfit / IsolatedMargin) * 100
 			pnl, pnlErr := strconv.ParseFloat(pos.UnRealizedProfit, 64)
-			margin, marginErr := strconv.ParseFloat(pos.IsolatedMargin, 64)
-			if pnlErr == nil && marginErr == nil && margin != 0 {
-				roe := (pnl / margin) * 100
-				message += fmt.Sprintf("   PnL: %s (%.2f%%)\n", pos.UnRealizedProfit, roe)
+
+			if pnlErr == nil && entryErr == nil && posErr == nil && entryPrice != 0 && positionAmt != 0 {
+				// Начальный номинал = цена входа * |размер позиции|
+				initialNotional := entryPrice * math.Abs(positionAmt)
+				// Процент = PnL / начальный номинал * 100
+				percent := (pnl / initialNotional) * 100
+				message += fmt.Sprintf("   PnL: %s (%.2f%%)\n", pos.UnRealizedProfit, percent)
 			} else {
 				message += fmt.Sprintf("   PnL: %s\n", pos.UnRealizedProfit)
 			}
@@ -1307,7 +1321,16 @@ func (b *Bot) sendLimitExceededNotifications(positions []*futures.PositionRisk, 
 		ageStr := b.formatPositionTime(openTime)
 
 		message += fmt.Sprintf("🔴 <b>%s %s</b>\n", symbol, side)
-		message += fmt.Sprintf("   Размер: %s\n", pos.PositionAmt)
+
+		// Размер позиции с номиналом в USDT
+		entryPrice, entryErr := strconv.ParseFloat(pos.EntryPrice, 64)
+		positionAmt, posErr := strconv.ParseFloat(pos.PositionAmt, 64)
+		if entryErr == nil && posErr == nil && entryPrice != 0 {
+			notionalValue := math.Abs(positionAmt) * entryPrice
+			message += fmt.Sprintf("   Размер: %s (%.2f USDT)\n", pos.PositionAmt, notionalValue)
+		} else {
+			message += fmt.Sprintf("   Размер: %s\n", pos.PositionAmt)
+		}
 		message += fmt.Sprintf("   Цена входа: %s\n", pos.EntryPrice)
 
 		// Отображаем PnL
@@ -1357,7 +1380,16 @@ func (b *Bot) sendLimitExceededNotificationsV2(exceededPositions []positionLimit
 		}
 
 		message += fmt.Sprintf("🔴 <b>%s %s</b>\n", pos.Symbol, side)
-		message += fmt.Sprintf("   Размер: %s\n", pos.PositionAmt)
+
+		// Размер позиции с номиналом в USDT
+		entryPrice, entryErr := strconv.ParseFloat(pos.EntryPrice, 64)
+		positionAmt, posErr := strconv.ParseFloat(pos.PositionAmt, 64)
+		if entryErr == nil && posErr == nil && entryPrice != 0 {
+			notionalValue := math.Abs(positionAmt) * entryPrice
+			message += fmt.Sprintf("   Размер: %s (%.2f USDT)\n", pos.PositionAmt, notionalValue)
+		} else {
+			message += fmt.Sprintf("   Размер: %s\n", pos.PositionAmt)
+		}
 		message += fmt.Sprintf("   Цена входа: %s\n", pos.EntryPrice)
 
 		// Отображаем PnL
