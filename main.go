@@ -962,9 +962,9 @@ func (b *Bot) handleLimitsCommand(update tgbotapi.Update) {
 	b.telegramBot.Send(msg)
 }
 
-// handleRemoveLimitCommand обрабатывает команду /lr (удаление всех лимитов по монете)
+// handleRemoveLimitCommand обрабатывает команду /remove_limit или /lr (удаление всех лимитов по монете)
 func (b *Bot) handleRemoveLimitCommand(update tgbotapi.Update) {
-	log.Printf("[INFO] Получена команда /lr от пользователя %d (chat ID: %d)",
+	log.Printf("[INFO] Получена команда /remove_limit или /lr от пользователя %d (chat ID: %d)",
 		update.Message.From.ID, update.Message.Chat.ID)
 
 	// Получаем аргументы команды
@@ -974,9 +974,9 @@ func (b *Bot) handleRemoveLimitCommand(update tgbotapi.Update) {
 	if args == "" {
 		msg := tgbotapi.NewMessage(update.Message.Chat.ID,
 			"❌ Неверный формат команды.\n\n"+
-				"Использование: /lr <coin>\n\n"+
+				"Использование: /remove_limit (или /lr) <coin>\n\n"+
 				"Примеры:\n"+
-				"/lr LSK - удалить все лимиты для LSK\n"+
+				"/remove_limit LSK - удалить все лимиты для LSK\n"+
 				"/lr BTC - удалить все лимиты для BTC")
 		b.telegramBot.Send(msg)
 		return
@@ -1556,7 +1556,7 @@ func (b *Bot) Start() {
 						"Доступные команды:\n"+
 						"/positions или /ps - просмотр открытых позиций\n"+
 						"/add_limit или /l - добавление лимитов\n"+
-						"/lr <coin> - удаление всех лимитов для монеты\n"+
+						"/remove_limit или /lr <coin> - удаление всех лимитов для монеты\n"+
 						"/limits или /ls - просмотр установленных лимитов\n"+
 						"/set_check_interval - установка интервала проверки позиций")
 				sentMsg, err := b.telegramBot.Send(msg)
@@ -1574,8 +1574,8 @@ func (b *Bot) Start() {
 			case "limits", "ls":
 				log.Printf("[DEBUG] Обрабатываю команду /%s", command)
 				b.handleLimitsCommand(update)
-			case "lr":
-				log.Printf("[DEBUG] Обрабатываю команду /lr")
+			case "remove_limit", "lr":
+				log.Printf("[DEBUG] Обрабатываю команду /%s", command)
 				b.handleRemoveLimitCommand(update)
 			case "set_check_interval":
 				log.Printf("[DEBUG] Обрабатываю команду /set_check_interval")
@@ -1586,7 +1586,7 @@ func (b *Bot) Start() {
 					"Неизвестная команда. Используйте:\n"+
 						"/positions или /ps - для просмотра позиций\n"+
 						"/add_limit или /l - для добавления лимитов\n"+
-						"/lr <coin> - для удаления лимитов по монете\n"+
+						"/remove_limit или /lr <coin> - для удаления лимитов по монете\n"+
 						"/limits или /ls - для просмотра установленных лимитов\n"+
 						"/set_check_interval - для установки интервала проверки")
 				sentMsg, err := b.telegramBot.Send(msg)
