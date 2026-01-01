@@ -940,6 +940,74 @@ func (b *Bot) handleLimitsCommand(update tgbotapi.Update) {
 	b.telegramBot.Send(msg)
 }
 
+// handleRemoveLimitCommand обрабатывает команду /lr (удаление всех лимитов по монете)
+func (b *Bot) handleRemoveLimitCommand(update tgbotapi.Update) {
+	log.Printf("[INFO] Получена команда /lr от пользователя %d (chat ID: %d)",
+		update.Message.From.ID, update.Message.Chat.ID)
+
+	// Получаем аргументы команды
+	args := update.Message.CommandArguments()
+	args = strings.TrimSpace(args)
+
+	if args == "" {
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+			"❌ Неверный формат команды.\n\n"+
+				"Использование: /lr <coin>\n\n"+
+				"Примеры:\n"+
+				"/lr LSK - удалить все лимиты для LSK\n"+
+				"/lr BTC - удалить все лимиты для BTC")
+		b.telegramBot.Send(msg)
+		return
+	}
+
+	coin := strings.ToUpper(args)
+
+	// Загружаем существующие лимиты
+	storage, err := b.loadLimits()
+	if err != nil {
+		log.Printf("[ERROR] Ошибка при загрузке лимитов: %v", err)
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+			"❌ Ошибка при загрузке лимитов. Попробуйте позже.")
+		b.telegramBot.Send(msg)
+		return
+	}
+
+	// Считаем количество лимитов для этой монеты и удаляем их
+	removedCount := 0
+	newLimits := make([]Limit, 0)
+	for _, limit := range storage.Limits {
+		if strings.ToUpper(limit.Coin) == coin {
+			removedCount++
+			log.Printf("[DEBUG] Удаляю лимит для %s (o%d): %s", limit.Coin, limit.OrderCount, limit.Time)
+		} else {
+			newLimits = append(newLimits, limit)
+		}
+	}
+
+	if removedCount == 0 {
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+			fmt.Sprintf("❌ Лимиты для %s не найдены.", coin))
+		b.telegramBot.Send(msg)
+		return
+	}
+
+	storage.Limits = newLimits
+
+	// Сохраняем лимиты
+	if err := b.saveLimits(storage); err != nil {
+		log.Printf("[ERROR] Ошибка при сохранении лимитов: %v", err)
+		msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+			"❌ Ошибка при сохранении лимитов. Попробуйте позже.")
+		b.telegramBot.Send(msg)
+		return
+	}
+
+	log.Printf("[INFO] Удалено %d лимитов для %s", removedCount, coin)
+	msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+		fmt.Sprintf("✅ Удалено лимитов для %s: %d", coin, removedCount))
+	b.telegramBot.Send(msg)
+}
+
 // handleSetCheckIntervalCommand обрабатывает команду /set_check_interval
 func (b *Bot) handleSetCheckIntervalCommand(update tgbotapi.Update) {
 	log.Printf("[INFO] Получена команда /set_check_interval от пользователя %d (chat ID: %d)",
@@ -1448,6 +1516,7 @@ func (b *Bot) Start() {
 						"Доступные команды:\n"+
 						"/positions или /ps - просмотр открытых позиций\n"+
 						"/add_limit или /l - добавление лимитов\n"+
+						"/lr <coin> - удаление всех лимитов для монеты\n"+
 						"/limits или /ls - просмотр установленных лимитов\n"+
 						"/set_check_interval - установка интервала проверки позиций")
 				sentMsg, err := b.telegramBot.Send(msg)
@@ -1465,6 +1534,9 @@ func (b *Bot) Start() {
 			case "limits", "ls":
 				log.Printf("[DEBUG] Обрабатываю команду /%s", command)
 				b.handleLimitsCommand(update)
+			case "lr":
+				log.Printf("[DEBUG] Обрабатываю команду /lr")
+				b.handleRemoveLimitCommand(update)
 			case "set_check_interval":
 				log.Printf("[DEBUG] Обрабатываю команду /set_check_interval")
 				b.handleSetCheckIntervalCommand(update)
@@ -1474,6 +1546,7 @@ func (b *Bot) Start() {
 					"Неизвестная команда. Используйте:\n"+
 						"/positions или /ps - для просмотра позиций\n"+
 						"/add_limit или /l - для добавления лимитов\n"+
+						"/lr <coin> - для удаления лимитов по монете\n"+
 						"/limits или /ls - для просмотра установленных лимитов\n"+
 						"/set_check_interval - для установки интервала проверки")
 				sentMsg, err := b.telegramBot.Send(msg)
