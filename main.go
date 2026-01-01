@@ -34,6 +34,7 @@ type Bot struct {
 	chatID            int64           // ID чата для отправки уведомлений
 	stopChecker       chan bool       // Канал для остановки проверки
 	notifiedPositions map[string]bool // Позиции, о которых уже отправлено уведомление о превышении лимита
+	notifiedBreakeven map[string]bool // Позиции, о которых уже отправлено уведомление о безубытке
 }
 
 func NewBot(telegramToken, binanceAPIKey, binanceSecretKey string) (*Bot, error) {
@@ -58,6 +59,7 @@ func NewBot(telegramToken, binanceAPIKey, binanceSecretKey string) (*Bot, error)
 		chatID:            0, // Будет установлен при первом сообщении
 		stopChecker:       make(chan bool),
 		notifiedPositions: make(map[string]bool),
+		notifiedBreakeven: make(map[string]bool),
 	}, nil
 }
 
@@ -343,6 +345,147 @@ func (b *Bot) getFilledOrdersCount(symbol string, positionOpenTime int64) (int, 
 	return filledCount, nil
 }
 
+// PositionCosts содержит информацию о расходах по позиции
+type PositionCosts struct {
+	TotalCommission float64 // Сумма комиссий (отрицательное значение = расход)
+	TotalFunding    float64 // Сумма фандинга (отрицательное = расход, положительное = доход)
+	TotalCost       float64 // Общая сумма расходов (положительное значение = расход)
+}
+
+// getPositionIncomeHistory получает историю доходов/расходов для позиции с момента её открытия
+func (b *Bot) getPositionIncomeHistory(symbol string, openTime int64) (*PositionCosts, error) {
+	ctx := context.Background()
+	costs := &PositionCosts{}
+
+	log.Printf("[DEBUG] Получаю историю доходов/расходов для %s с времени %d", symbol, openTime)
+
+	// Получаем комиссии (COMMISSION)
+	commissions, err := b.binanceClient.NewGetIncomeHistoryService().
+		Symbol(symbol).
+		IncomeType("COMMISSION").
+		StartTime(openTime).
+		Limit(1000).
+		Do(ctx)
+	if err != nil {
+		log.Printf("[WARN] Не удалось получить историю комиссий для %s: %v", symbol, err)
+	} else {
+		for _, income := range commissions {
+			val, err := strconv.ParseFloat(income.Income, 64)
+			if err == nil {
+				costs.TotalCommission += val
+			}
+		}
+		log.Printf("[DEBUG] Комиссии для %s: %.6f USDT (%d записей)", symbol, costs.TotalCommission, len(commissions))
+	}
+
+	// Получаем фандинг (FUNDING_FEE)
+	funding, err := b.binanceClient.NewGetIncomeHistoryService().
+		Symbol(symbol).
+		IncomeType("FUNDING_FEE").
+		StartTime(openTime).
+		Limit(1000).
+		Do(ctx)
+	if err != nil {
+		log.Printf("[WARN] Не удалось получить историю фандинга для %s: %v", symbol, err)
+	} else {
+		for _, income := range funding {
+			val, err := strconv.ParseFloat(income.Income, 64)
+			if err == nil {
+				costs.TotalFunding += val
+			}
+		}
+		log.Printf("[DEBUG] Фандинг для %s: %.6f USDT (%d записей)", symbol, costs.TotalFunding, len(funding))
+	}
+
+	// Общая сумма расходов (инвертируем, т.к. income отрицательный = расход)
+	// Commission всегда отрицательный (мы платим)
+	// Funding может быть положительным (получаем) или отрицательным (платим)
+	costs.TotalCost = -(costs.TotalCommission + costs.TotalFunding)
+	log.Printf("[DEBUG] Общая сумма расходов для %s: %.6f USDT", symbol, costs.TotalCost)
+
+	return costs, nil
+}
+
+// BreakevenInfo содержит информацию о цене безубыточности позиции
+type BreakevenInfo struct {
+	BreakevenPrice  float64        // Цена безубыточности
+	CurrentPrice    float64        // Текущая цена
+	EntryPrice      float64        // Цена входа
+	PositionSize    float64        // Размер позиции
+	Costs           *PositionCosts // Расходы по позиции
+	IsLong          bool           // true = LONG, false = SHORT
+	IsAtBreakeven   bool           // Достигнут ли безубыток
+	DistancePercent float64        // Расстояние до безубытка в процентах (отрицательное = ниже безубытка)
+}
+
+// calculateBreakevenPrice рассчитывает цену безубыточности для позиции
+// Формула:
+// - Для LONG: breakeven = entryPrice + totalCost / positionSize
+// - Для SHORT: breakeven = entryPrice - totalCost / positionSize
+func (b *Bot) calculateBreakevenPrice(pos *futures.PositionRisk, openTime int64) (*BreakevenInfo, error) {
+	info := &BreakevenInfo{}
+
+	// Парсим данные позиции
+	entryPrice, err := strconv.ParseFloat(pos.EntryPrice, 64)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка парсинга цены входа: %w", err)
+	}
+	info.EntryPrice = entryPrice
+
+	positionAmt, err := strconv.ParseFloat(pos.PositionAmt, 64)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка парсинга размера позиции: %w", err)
+	}
+	info.PositionSize = math.Abs(positionAmt)
+	info.IsLong = positionAmt > 0
+
+	markPrice, err := strconv.ParseFloat(pos.MarkPrice, 64)
+	if err != nil {
+		// Если не можем получить MarkPrice, используем цену входа
+		markPrice = entryPrice
+	}
+	info.CurrentPrice = markPrice
+
+	// Получаем расходы по позиции
+	costs, err := b.getPositionIncomeHistory(pos.Symbol, openTime)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка получения расходов: %w", err)
+	}
+	info.Costs = costs
+
+	// Рассчитываем цену безубыточности
+	if info.PositionSize > 0 {
+		costPerUnit := costs.TotalCost / info.PositionSize
+		if info.IsLong {
+			// Для LONG: нужно продать выше цены входа на сумму расходов
+			info.BreakevenPrice = entryPrice + costPerUnit
+		} else {
+			// Для SHORT: нужно откупить ниже цены входа на сумму расходов
+			info.BreakevenPrice = entryPrice - costPerUnit
+		}
+	} else {
+		info.BreakevenPrice = entryPrice
+	}
+
+	// Проверяем достижение безубытка
+	if info.IsLong {
+		// Для LONG: безубыток достигнут, если текущая цена >= breakeven
+		info.IsAtBreakeven = info.CurrentPrice >= info.BreakevenPrice
+		// Расстояние до безубытка в процентах
+		info.DistancePercent = (info.CurrentPrice - info.BreakevenPrice) / info.BreakevenPrice * 100
+	} else {
+		// Для SHORT: безубыток достигнут, если текущая цена <= breakeven
+		info.IsAtBreakeven = info.CurrentPrice <= info.BreakevenPrice
+		// Для SHORT расстояние инвертировано
+		info.DistancePercent = (info.BreakevenPrice - info.CurrentPrice) / info.BreakevenPrice * 100
+	}
+
+	log.Printf("[DEBUG] Безубыток для %s: entry=%.4f, breakeven=%.4f, current=%.4f, cost=%.4f, isAtBE=%v",
+		pos.Symbol, entryPrice, info.BreakevenPrice, info.CurrentPrice, costs.TotalCost, info.IsAtBreakeven)
+
+	return info, nil
+}
+
 func (b *Bot) formatPositionsMessage(positions []*futures.PositionRisk) string {
 	log.Printf("[DEBUG] Форматирую сообщение для %d позиций", len(positions))
 	if len(positions) == 0 {
@@ -416,6 +559,24 @@ func (b *Bot) formatPositionsMessage(positions []*futures.PositionRisk) string {
 
 		message += fmt.Sprintf("   Исполненных ордеров: %d\n", filledOrdersCount)
 		message += fmt.Sprintf("   Время сделки: %s назад\n", timeStr)
+
+		// Рассчитываем и отображаем цену безубыточности
+		beInfo, beErr := b.calculateBreakevenPrice(pos, openTime)
+		if beErr == nil {
+			// Форматируем цену с адаптивной точностью
+			var beStatus string
+			if beInfo.IsAtBreakeven {
+				beStatus = fmt.Sprintf("✅ %.4f (достигнут, %.2f%%)", beInfo.BreakevenPrice, beInfo.DistancePercent)
+			} else {
+				beStatus = fmt.Sprintf("🎯 %.4f (%.2f%%)", beInfo.BreakevenPrice, beInfo.DistancePercent)
+			}
+			message += fmt.Sprintf("   Безубыток: %s\n", beStatus)
+			// Показываем расходы
+			if beInfo.Costs.TotalCost != 0 {
+				message += fmt.Sprintf("   📊 Комиссия: %.4f, Фандинг: %.4f\n",
+					-beInfo.Costs.TotalCommission, -beInfo.Costs.TotalFunding)
+			}
+		}
 
 		// Проверяем превышение лимита с учетом количества исполненных ордеров
 		symbol := pos.Symbol
@@ -1353,6 +1514,128 @@ func (b *Bot) sendLimitExceededNotifications(positions []*futures.PositionRisk, 
 	}
 }
 
+// checkBreakevenNotifications проверяет позиции на достижение безубытка
+func (b *Bot) checkBreakevenNotifications() {
+	if b.chatID == 0 {
+		log.Printf("[DEBUG] ChatID не установлен, пропускаю проверку безубытка")
+		return
+	}
+
+	log.Printf("[DEBUG] Начинаю проверку позиций на достижение безубытка...")
+
+	// Получаем открытые позиции
+	positions, err := b.getOpenPositions()
+	if err != nil {
+		log.Printf("[ERROR] Ошибка при получении позиций для проверки безубытка: %v", err)
+		return
+	}
+
+	if len(positions) == 0 {
+		log.Printf("[DEBUG] Нет открытых позиций для проверки безубытка")
+		// Очищаем карту уведомленных позиций
+		b.notifiedBreakeven = make(map[string]bool)
+		return
+	}
+
+	// Создаем карту текущих открытых позиций для очистки notifiedBreakeven
+	currentPositions := make(map[string]bool)
+	for _, pos := range positions {
+		currentPositions[pos.Symbol] = true
+	}
+
+	// Очищаем notifiedBreakeven от закрытых позиций
+	for key := range b.notifiedBreakeven {
+		if !currentPositions[key] {
+			log.Printf("[DEBUG] Удаляю %s из уведомлений о безубытке (позиция закрыта)", key)
+			delete(b.notifiedBreakeven, key)
+		}
+	}
+
+	// Проверяем каждую позицию
+	var breakevenPositions []*BreakevenInfo
+	var breakevenSymbols []string
+
+	for _, pos := range positions {
+		// Определяем направление позиции
+		isLong := true
+		if len(pos.PositionAmt) > 0 && pos.PositionAmt[0] == '-' {
+			isLong = false
+		}
+
+		// Получаем время открытия позиции
+		openTime, err := b.getPositionOpenTime(pos.Symbol, isLong)
+		if err != nil {
+			log.Printf("[WARN] Не удалось получить время открытия для %s: %v", pos.Symbol, err)
+			continue
+		}
+
+		// Рассчитываем безубыток
+		beInfo, err := b.calculateBreakevenPrice(pos, openTime)
+		if err != nil {
+			log.Printf("[WARN] Не удалось рассчитать безубыток для %s: %v", pos.Symbol, err)
+			continue
+		}
+
+		// Проверяем достижение безубытка
+		if beInfo.IsAtBreakeven {
+			// Проверяем, было ли уже уведомление
+			if !b.notifiedBreakeven[pos.Symbol] {
+				log.Printf("[INFO] Позиция %s достигла безубытка!", pos.Symbol)
+				breakevenPositions = append(breakevenPositions, beInfo)
+				breakevenSymbols = append(breakevenSymbols, pos.Symbol)
+			}
+		} else {
+			// Если позиция ушла из безубытка, сбрасываем флаг
+			if b.notifiedBreakeven[pos.Symbol] {
+				log.Printf("[DEBUG] Позиция %s ушла из безубытка, сбрасываю флаг", pos.Symbol)
+				delete(b.notifiedBreakeven, pos.Symbol)
+			}
+		}
+	}
+
+	// Отправляем уведомления о достижении безубытка
+	if len(breakevenPositions) > 0 {
+		b.sendBreakevenNotifications(breakevenPositions, breakevenSymbols)
+		// Отмечаем позиции как уведомленные
+		for _, symbol := range breakevenSymbols {
+			b.notifiedBreakeven[symbol] = true
+			log.Printf("[DEBUG] Позиция %s отмечена как уведомленная о безубытке", symbol)
+		}
+	}
+}
+
+// sendBreakevenNotifications отправляет уведомления о достижении безубытка
+func (b *Bot) sendBreakevenNotifications(positions []*BreakevenInfo, symbols []string) {
+	log.Printf("[INFO] Отправляю уведомления о %d позициях, достигших безубытка", len(positions))
+
+	message := "✅ <b>БЕЗУБЫТОК ДОСТИГНУТ!</b>\n\n"
+
+	for i, info := range positions {
+		side := "LONG"
+		if !info.IsLong {
+			side = "SHORT"
+		}
+
+		message += fmt.Sprintf("🎯 <b>%s %s</b>\n", symbols[i], side)
+		message += fmt.Sprintf("   Цена входа: %.4f\n", info.EntryPrice)
+		message += fmt.Sprintf("   Безубыток: %.4f\n", info.BreakevenPrice)
+		message += fmt.Sprintf("   Текущая цена: %.4f (%.2f%%)\n", info.CurrentPrice, info.DistancePercent)
+		message += fmt.Sprintf("   📊 Комиссия: %.4f USDT\n", -info.Costs.TotalCommission)
+		message += fmt.Sprintf("   📊 Фандинг: %.4f USDT\n", -info.Costs.TotalFunding)
+		message += fmt.Sprintf("   💰 Всего расходов: %.4f USDT\n\n", info.Costs.TotalCost)
+	}
+
+	message += "💡 <i>Позиция достигла уровня, при котором можно закрыться без убытка.</i>"
+
+	// Отправляем сообщение
+	err := b.sendLongMessage(b.chatID, message, "HTML")
+	if err != nil {
+		log.Printf("[ERROR] Ошибка при отправке уведомления о безубытке: %v", err)
+	} else {
+		log.Printf("[INFO] Уведомление о безубытке отправлено успешно")
+	}
+}
+
 // sendLimitExceededNotificationsV2 отправляет уведомления о позициях, превысивших лимит (с учетом количества ордеров)
 func (b *Bot) sendLimitExceededNotificationsV2(exceededPositions []positionLimitInfo) {
 	log.Printf("[INFO] Отправляю уведомления о %d позициях, превысивших лимит", len(exceededPositions))
@@ -1451,6 +1734,7 @@ func (b *Bot) startPositionChecker() {
 			select {
 			case <-ticker.C:
 				b.checkPositionsForLimits()
+				b.checkBreakevenNotifications()
 			case <-b.stopChecker:
 				log.Printf("[INFO] Остановка фоновой проверки позиций")
 				return
