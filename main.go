@@ -27,11 +27,12 @@ type LimitsStorage struct {
 }
 
 type Bot struct {
-	telegramBot   *tgbotapi.BotAPI
-	binanceClient *futures.Client
-	limitsFile    string
-	chatID        int64     // ID чата для отправки уведомлений
-	stopChecker   chan bool // Канал для остановки проверки
+	telegramBot       *tgbotapi.BotAPI
+	binanceClient     *futures.Client
+	limitsFile        string
+	chatID            int64           // ID чата для отправки уведомлений
+	stopChecker       chan bool       // Канал для остановки проверки
+	notifiedPositions map[string]bool // Позиции, о которых уже отправлено уведомление о превышении лимита
 }
 
 func NewBot(telegramToken, binanceAPIKey, binanceSecretKey string) (*Bot, error) {
@@ -50,11 +51,12 @@ func NewBot(telegramToken, binanceAPIKey, binanceSecretKey string) (*Bot, error)
 	log.Println("[DEBUG] Binance Futures клиент успешно создан")
 
 	return &Bot{
-		telegramBot:   bot,
-		binanceClient: binanceClient,
-		limitsFile:    "limits.json",
-		chatID:        0, // Будет установлен при первом сообщении
-		stopChecker:   make(chan bool),
+		telegramBot:       bot,
+		binanceClient:     binanceClient,
+		limitsFile:        "limits.json",
+		chatID:            0, // Будет установлен при первом сообщении
+		stopChecker:       make(chan bool),
+		notifiedPositions: make(map[string]bool),
 	}, nil
 }
 
@@ -920,6 +922,8 @@ func (b *Bot) checkPositionsForLimits() {
 
 	if len(positions) == 0 {
 		log.Printf("[DEBUG] Нет открытых позиций для проверки")
+		// Очищаем карту уведомленных позиций, так как все позиции закрыты
+		b.notifiedPositions = make(map[string]bool)
 		return
 	}
 
@@ -932,6 +936,20 @@ func (b *Bot) checkPositionsForLimits() {
 			continue
 		}
 		limitsMap[strings.ToUpper(limit.Coin)] = duration
+	}
+
+	// Создаем карту текущих открытых позиций для очистки notifiedPositions
+	currentPositions := make(map[string]bool)
+	for _, pos := range positions {
+		currentPositions[pos.Symbol] = true
+	}
+
+	// Очищаем notifiedPositions от закрытых позиций
+	for symbol := range b.notifiedPositions {
+		if !currentPositions[symbol] {
+			log.Printf("[DEBUG] Удаляю %s из уведомленных позиций (позиция закрыта)", symbol)
+			delete(b.notifiedPositions, symbol)
+		}
 	}
 
 	// Проверяем каждую позицию
@@ -978,17 +996,33 @@ func (b *Bot) checkPositionsForLimits() {
 
 		// Проверяем, превышает ли время жизни лимит
 		if positionAge > limitDuration {
+			// Проверяем, было ли уже отправлено уведомление для этой позиции
+			if b.notifiedPositions[symbol] {
+				log.Printf("[DEBUG] Позиция %s превышает лимит, но уведомление уже было отправлено", symbol)
+				continue
+			}
 			log.Printf("[INFO] Позиция %s превысила лимит: возраст %v, лимит %v",
 				symbol, positionAge, limitDuration)
 			exceededPositions = append(exceededPositions, pos)
+		} else {
+			// Если позиция вернулась в пределы лимита, удаляем из уведомленных
+			if b.notifiedPositions[symbol] {
+				log.Printf("[DEBUG] Позиция %s вернулась в пределы лимита, сбрасываю флаг уведомления", symbol)
+				delete(b.notifiedPositions, symbol)
+			}
 		}
 	}
 
 	// Отправляем уведомления о позициях, превысивших лимит
 	if len(exceededPositions) > 0 {
 		b.sendLimitExceededNotifications(exceededPositions, storage)
+		// Отмечаем позиции как уведомленные
+		for _, pos := range exceededPositions {
+			b.notifiedPositions[pos.Symbol] = true
+			log.Printf("[DEBUG] Позиция %s отмечена как уведомленная", pos.Symbol)
+		}
 	} else {
-		log.Printf("[DEBUG] Все позиции в пределах лимитов")
+		log.Printf("[DEBUG] Все позиции в пределах лимитов или уже уведомлены")
 	}
 }
 
