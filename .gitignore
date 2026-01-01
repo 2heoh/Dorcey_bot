@@ -34,3 +34,4 @@ limits.json
 *.swp
 *.swo
 *~
+*.log
