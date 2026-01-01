@@ -1155,7 +1155,7 @@ func (b *Bot) Start() {
 						"Доступные команды:\n"+
 						"/positions или /ps - просмотр открытых позиций\n"+
 						"/add_limit - добавление лимитов\n"+
-						"/limits - просмотр установленных лимитов\n"+
+						"/limits или /ls - просмотр установленных лимитов\n"+
 						"/set_check_interval - установка интервала проверки позиций")
 				sentMsg, err := b.telegramBot.Send(msg)
 				if err != nil {
@@ -1169,8 +1169,8 @@ func (b *Bot) Start() {
 			case "add_limit":
 				log.Printf("[DEBUG] Обрабатываю команду /add_limit")
 				b.handleAddLimitCommand(update)
-			case "limits":
-				log.Printf("[DEBUG] Обрабатываю команду /limits")
+			case "limits", "ls":
+				log.Printf("[DEBUG] Обрабатываю команду /%s", command)
 				b.handleLimitsCommand(update)
 			case "set_check_interval":
 				log.Printf("[DEBUG] Обрабатываю команду /set_check_interval")
@@ -1181,7 +1181,7 @@ func (b *Bot) Start() {
 					"Неизвестная команда. Используйте:\n"+
 						"/positions или /ps - для просмотра позиций\n"+
 						"/add_limit - для добавления лимитов\n"+
-						"/limits - для просмотра установленных лимитов\n"+
+						"/limits или /ls - для просмотра установленных лимитов\n"+
 						"/set_check_interval - для установки интервала проверки")
 				sentMsg, err := b.telegramBot.Send(msg)
 				if err != nil {
