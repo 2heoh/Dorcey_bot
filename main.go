@@ -385,11 +385,19 @@ func (b *Bot) formatPositionsMessage(positions []*futures.PositionRisk) string {
 		message += fmt.Sprintf("   Размер: %s\n", pos.PositionAmt)
 		message += fmt.Sprintf("   Цена входа: %s\n", pos.EntryPrice)
 
-		// Отображаем PnL только если он не равен нулю
+		// Отображаем PnL с процентом просадки (ROE%)
 		if pos.UnRealizedProfit != "" && pos.UnRealizedProfit != "0" && pos.UnRealizedProfit != "0.0" {
-			message += fmt.Sprintf("   PnL: %s\n", pos.UnRealizedProfit)
+			// Вычисляем ROE% = (UnRealizedProfit / IsolatedMargin) * 100
+			pnl, pnlErr := strconv.ParseFloat(pos.UnRealizedProfit, 64)
+			margin, marginErr := strconv.ParseFloat(pos.IsolatedMargin, 64)
+			if pnlErr == nil && marginErr == nil && margin != 0 {
+				roe := (pnl / margin) * 100
+				message += fmt.Sprintf("   PnL: %s (%.2f%%)\n", pos.UnRealizedProfit, roe)
+			} else {
+				message += fmt.Sprintf("   PnL: %s\n", pos.UnRealizedProfit)
+			}
 		} else {
-			message += "   PnL: 0.00\n"
+			message += "   PnL: 0.00 (0.00%)\n"
 		}
 
 		message += fmt.Sprintf("   Исполненных ордеров: %d\n", filledOrdersCount)
