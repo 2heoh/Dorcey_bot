@@ -232,7 +232,7 @@ func calculatePositionOpenTime(orders []*futures.Order, isLong bool) int64 {
 		}
 
 		// Определяем направление позиции до и после ордера
-		wasLong := prevBalance > 0.0000001  // Небольшой порог для float сравнения
+		wasLong := prevBalance > 0.0000001 // Небольшой порог для float сравнения
 		wasShort := prevBalance < -0.0000001
 		wasZero := !wasLong && !wasShort
 
@@ -298,7 +298,7 @@ func (b *Bot) getPositionOpenTime(symbol string, isLong bool) (int64, error) {
 
 	log.Printf("[DEBUG] Найдено время открытия для %s: %d", symbol, openTime)
 	return openTime, nil
-	}
+}
 
 // calculateFilledOrdersCount подсчитывает исполненные ордера после времени открытия позиции
 func calculateFilledOrdersCount(orders []*futures.Order, positionOpenTime int64) int {
@@ -323,7 +323,7 @@ func (b *Bot) getFilledOrdersCount(symbol string, positionOpenTime int64) (int, 
 	ctx := context.Background()
 
 	log.Printf("[DEBUG] Получаю количество исполненных ордеров для %s (после времени открытия: %d)...", symbol, positionOpenTime)
-	
+
 	// Получаем все ордера (максимум 1000 для Binance Futures API)
 	orders, err := b.binanceClient.NewListOrdersService().
 		Symbol(symbol).
@@ -344,6 +344,27 @@ func (b *Bot) formatPositionsMessage(positions []*futures.PositionRisk) string {
 	log.Printf("[DEBUG] Форматирую сообщение для %d позиций", len(positions))
 	if len(positions) == 0 {
 		return "У вас нет открытых позиций на futures."
+	}
+
+	// Загружаем лимиты для проверки превышения
+	storage, err := b.loadLimits()
+	if err != nil {
+		log.Printf("[WARN] Не удалось загрузить лимиты: %v", err)
+		storage = &LimitsStorage{Limits: make([]Limit, 0)}
+	}
+
+	// Создаем карту лимитов для быстрого поиска
+	limitsMap := make(map[string]time.Duration)
+	limitsStrMap := make(map[string]string)
+	for _, limit := range storage.Limits {
+		duration, err := parseTime(limit.Time)
+		if err != nil {
+			log.Printf("[WARN] Не удалось распарсить лимит для %s: %v", limit.Coin, err)
+			continue
+		}
+		coinUpper := strings.ToUpper(limit.Coin)
+		limitsMap[coinUpper] = duration
+		limitsStrMap[coinUpper] = limit.Time
 	}
 
 	message := "📊 Открытые позиции на Futures:\n\n"
@@ -383,7 +404,38 @@ func (b *Bot) formatPositionsMessage(positions []*futures.PositionRisk) string {
 		}
 
 		message += fmt.Sprintf("   Исполненных ордеров: %d\n", filledOrdersCount)
-		message += fmt.Sprintf("   Время сделки: %s назад\n\n", timeStr)
+		message += fmt.Sprintf("   Время сделки: %s назад\n", timeStr)
+
+		// Проверяем превышение лимита
+		symbol := pos.Symbol
+		coin := symbol
+		commonSuffixes := []string{"USDT", "BUSD", "USDC", "BTC", "ETH", "BNB"}
+		for _, suffix := range commonSuffixes {
+			if strings.HasSuffix(symbol, suffix) {
+				coin = strings.TrimSuffix(symbol, suffix)
+				break
+			}
+		}
+		coinUpper := strings.ToUpper(coin)
+
+		if limitDuration, exists := limitsMap[coinUpper]; exists {
+			now := time.Now().UnixMilli()
+			positionAge := time.Duration(now-openTime) * time.Millisecond
+
+			if positionAge > limitDuration {
+				exceeded := positionAge - limitDuration
+				exceededHours := int(exceeded.Hours())
+				exceededMinutes := int(exceeded.Minutes()) % 60
+				message += fmt.Sprintf("   ⚠️ Лимит %s превышен на %d ч %d мин\n", limitsStrMap[coinUpper], exceededHours, exceededMinutes)
+			} else {
+				remaining := limitDuration - positionAge
+				remainingHours := int(remaining.Hours())
+				remainingMinutes := int(remaining.Minutes()) % 60
+				message += fmt.Sprintf("   ⏱ Лимит %s: осталось %d ч %d мин\n", limitsStrMap[coinUpper], remainingHours, remainingMinutes)
+			}
+		}
+
+		message += "\n"
 	}
 
 	log.Printf("[DEBUG] Сообщение сформировано, длина: %d символов", len(message))
@@ -611,11 +663,11 @@ func (b *Bot) handleAddLimitCommand(update tgbotapi.Update) {
 	if len(parts) < 2 {
 		msg := tgbotapi.NewMessage(update.Message.Chat.ID,
 			"❌ Неверный формат команды.\n\n"+
-				"Использование: /add_limit <coin> <time>\n\n"+
+				"Использование: /add_limit (или /l) <coin> <time>\n\n"+
 				"Примеры:\n"+
-				"/add_limit LSK 12h\n"+
-				"/add_limit BTC 30m\n"+
-				"/add_limit ETH 1d\n\n"+
+				"/l LSK 12h\n"+
+				"/l BTC 30m\n"+
+				"/l ETH 1d\n\n"+
 				"Единицы времени: s (секунды), m (минуты), h (часы), d (дни)")
 		b.telegramBot.Send(msg)
 		return
@@ -1154,7 +1206,7 @@ func (b *Bot) Start() {
 					"Привет! Я бот для отслеживания открытых позиций на Binance Futures.\n\n"+
 						"Доступные команды:\n"+
 						"/positions или /ps - просмотр открытых позиций\n"+
-						"/add_limit - добавление лимитов\n"+
+						"/add_limit или /l - добавление лимитов\n"+
 						"/limits или /ls - просмотр установленных лимитов\n"+
 						"/set_check_interval - установка интервала проверки позиций")
 				sentMsg, err := b.telegramBot.Send(msg)
@@ -1166,8 +1218,8 @@ func (b *Bot) Start() {
 			case "positions", "ps":
 				log.Printf("[DEBUG] Обрабатываю команду /%s", command)
 				b.handlePositionsCommand(update)
-			case "add_limit":
-				log.Printf("[DEBUG] Обрабатываю команду /add_limit")
+			case "add_limit", "l":
+				log.Printf("[DEBUG] Обрабатываю команду /%s", command)
 				b.handleAddLimitCommand(update)
 			case "limits", "ls":
 				log.Printf("[DEBUG] Обрабатываю команду /%s", command)
@@ -1180,7 +1232,7 @@ func (b *Bot) Start() {
 				msg := tgbotapi.NewMessage(update.Message.Chat.ID,
 					"Неизвестная команда. Используйте:\n"+
 						"/positions или /ps - для просмотра позиций\n"+
-						"/add_limit - для добавления лимитов\n"+
+						"/add_limit или /l - для добавления лимитов\n"+
 						"/limits или /ls - для просмотра установленных лимитов\n"+
 						"/set_check_interval - для установки интервала проверки")
 				sentMsg, err := b.telegramBot.Send(msg)
