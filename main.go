@@ -17,8 +17,9 @@ import (
 )
 
 type Limit struct {
-	Coin string `json:"coin"`
-	Time string `json:"time"`
+	Coin       string `json:"coin"`
+	Time       string `json:"time"`
+	OrderCount int    `json:"order_count,omitempty"` // 0 = для всей позиции, 1+ = для N исполненных ордеров
 }
 
 type LimitsStorage struct {
@@ -355,20 +356,6 @@ func (b *Bot) formatPositionsMessage(positions []*futures.PositionRisk) string {
 		storage = &LimitsStorage{Limits: make([]Limit, 0)}
 	}
 
-	// Создаем карту лимитов для быстрого поиска
-	limitsMap := make(map[string]time.Duration)
-	limitsStrMap := make(map[string]string)
-	for _, limit := range storage.Limits {
-		duration, err := parseTime(limit.Time)
-		if err != nil {
-			log.Printf("[WARN] Не удалось распарсить лимит для %s: %v", limit.Coin, err)
-			continue
-		}
-		coinUpper := strings.ToUpper(limit.Coin)
-		limitsMap[coinUpper] = duration
-		limitsStrMap[coinUpper] = limit.Time
-	}
-
 	message := "📊 Открытые позиции на Futures:\n\n"
 
 	for i, pos := range positions {
@@ -402,13 +389,13 @@ func (b *Bot) formatPositionsMessage(positions []*futures.PositionRisk) string {
 		if pos.UnRealizedProfit != "" && pos.UnRealizedProfit != "0" && pos.UnRealizedProfit != "0.0" {
 			message += fmt.Sprintf("   PnL: %s\n", pos.UnRealizedProfit)
 		} else {
-			message += fmt.Sprintf("   PnL: 0.00\n")
+			message += "   PnL: 0.00\n"
 		}
 
 		message += fmt.Sprintf("   Исполненных ордеров: %d\n", filledOrdersCount)
 		message += fmt.Sprintf("   Время сделки: %s назад\n", timeStr)
 
-		// Проверяем превышение лимита
+		// Проверяем превышение лимита с учетом количества исполненных ордеров
 		symbol := pos.Symbol
 		coin := symbol
 		commonSuffixes := []string{"USDT", "BUSD", "USDC", "BTC", "ETH", "BNB"}
@@ -418,22 +405,29 @@ func (b *Bot) formatPositionsMessage(positions []*futures.PositionRisk) string {
 				break
 			}
 		}
-		coinUpper := strings.ToUpper(coin)
 
-		if limitDuration, exists := limitsMap[coinUpper]; exists {
+		// Используем новую функцию для выбора лимита
+		limitDuration, limitTimeStr, limitOrderCount, hasLimit := getLimitForPosition(storage.Limits, coin, filledOrdersCount)
+		if hasLimit {
 			now := time.Now().UnixMilli()
 			positionAge := time.Duration(now-openTime) * time.Millisecond
+
+			// Формируем строку с информацией о типе лимита
+			var limitTypeStr string
+			if limitOrderCount > 0 {
+				limitTypeStr = fmt.Sprintf(" (o%d)", limitOrderCount)
+			}
 
 			if positionAge > limitDuration {
 				exceeded := positionAge - limitDuration
 				exceededHours := int(exceeded.Hours())
 				exceededMinutes := int(exceeded.Minutes()) % 60
-				message += fmt.Sprintf("   ⚠️ Лимит %s превышен на %d ч %d мин\n", limitsStrMap[coinUpper], exceededHours, exceededMinutes)
+				message += fmt.Sprintf("   ⚠️ Лимит %s%s превышен на %d ч %d мин\n", limitTimeStr, limitTypeStr, exceededHours, exceededMinutes)
 			} else {
 				remaining := limitDuration - positionAge
 				remainingHours := int(remaining.Hours())
 				remainingMinutes := int(remaining.Minutes()) % 60
-				message += fmt.Sprintf("   ⏱ Лимит %s: осталось %d ч %d мин\n", limitsStrMap[coinUpper], remainingHours, remainingMinutes)
+				message += fmt.Sprintf("   ⏱ Лимит %s%s: осталось %d ч %d мин\n", limitTimeStr, limitTypeStr, remainingHours, remainingMinutes)
 			}
 		}
 
@@ -653,6 +647,84 @@ func parseTime(timeStr string) (time.Duration, error) {
 	return duration, nil
 }
 
+// parseOrderCount парсит строку вида "o1", "o2" и возвращает номер ордера
+// Возвращает 0 если строка не является номером ордера
+func parseOrderCount(s string) int {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if !strings.HasPrefix(s, "o") {
+		return 0
+	}
+	numStr := s[1:]
+	num, err := strconv.Atoi(numStr)
+	if err != nil || num < 1 {
+		return 0
+	}
+	return num
+}
+
+// getLimitForPosition возвращает подходящий лимит для позиции с учетом количества исполненных ордеров
+// Возвращает: duration, timeStr, orderCount лимита, found
+// Логика выбора:
+// 1. Если есть точный лимит для количества ордеров (oN) - используем его
+// 2. Если нет точного, ищем ближайший меньший лимит по количеству ордеров
+// 3. Если есть только общий лимит (orderCount=0) - используем его
+func getLimitForPosition(limits []Limit, coin string, filledOrdersCount int) (time.Duration, string, int, bool) {
+	coinUpper := strings.ToUpper(coin)
+
+	// Собираем все лимиты для этой монеты
+	var coinLimits []Limit
+	for _, limit := range limits {
+		if strings.ToUpper(limit.Coin) == coinUpper {
+			coinLimits = append(coinLimits, limit)
+		}
+	}
+
+	if len(coinLimits) == 0 {
+		return 0, "", 0, false
+	}
+
+	// Сначала ищем точное совпадение по количеству ордеров
+	for _, limit := range coinLimits {
+		if limit.OrderCount == filledOrdersCount && filledOrdersCount > 0 {
+			duration, err := parseTime(limit.Time)
+			if err != nil {
+				continue
+			}
+			return duration, limit.Time, limit.OrderCount, true
+		}
+	}
+
+	// Если нет точного совпадения, ищем ближайший меньший лимит по количеству ордеров
+	var bestLimit *Limit
+	bestOrderCount := -1
+	for i, limit := range coinLimits {
+		if limit.OrderCount > 0 && limit.OrderCount <= filledOrdersCount && limit.OrderCount > bestOrderCount {
+			bestLimit = &coinLimits[i]
+			bestOrderCount = limit.OrderCount
+		}
+	}
+
+	if bestLimit != nil {
+		duration, err := parseTime(bestLimit.Time)
+		if err == nil {
+			return duration, bestLimit.Time, bestLimit.OrderCount, true
+		}
+	}
+
+	// Если нет лимитов по количеству ордеров, используем общий лимит (orderCount=0)
+	for _, limit := range coinLimits {
+		if limit.OrderCount == 0 {
+			duration, err := parseTime(limit.Time)
+			if err != nil {
+				continue
+			}
+			return duration, limit.Time, 0, true
+		}
+	}
+
+	return 0, "", 0, false
+}
+
 // handleAddLimitCommand обрабатывает команду /add_limit
 func (b *Bot) handleAddLimitCommand(update tgbotapi.Update) {
 	log.Printf("[INFO] Получена команда /add_limit от пользователя %d (chat ID: %d)",
@@ -665,9 +737,11 @@ func (b *Bot) handleAddLimitCommand(update tgbotapi.Update) {
 	if len(parts) < 2 {
 		msg := tgbotapi.NewMessage(update.Message.Chat.ID,
 			"❌ Неверный формат команды.\n\n"+
-				"Использование: /add_limit (или /l) <coin> <time>\n\n"+
+				"Использование: /add_limit (или /l) <coin> [oN] <time>\n\n"+
 				"Примеры:\n"+
-				"/l LSK 12h\n"+
+				"/l LSK 12h - общий лимит для LSK\n"+
+				"/l LSK o1 6h - лимит для 1-го исполненного ордера\n"+
+				"/l LSK o2 12h - лимит для 2-го исполненного ордера\n"+
 				"/l BTC 30m\n"+
 				"/l ETH 1d\n\n"+
 				"Единицы времени: s (секунды), m (минуты), h (часы), d (дни)")
@@ -676,7 +750,25 @@ func (b *Bot) handleAddLimitCommand(update tgbotapi.Update) {
 	}
 
 	coin := strings.ToUpper(strings.TrimSpace(parts[0]))
-	timeStr := strings.TrimSpace(parts[1])
+	var timeStr string
+	var orderCount int
+
+	// Парсим аргументы: может быть "/l LSK 12h" или "/l LSK o1 6h"
+	if len(parts) >= 3 {
+		// Проверяем, является ли второй аргумент номером ордера (o1, o2, ...)
+		orderCount = parseOrderCount(parts[1])
+		if orderCount > 0 {
+			timeStr = strings.TrimSpace(parts[2])
+		} else {
+			// Второй аргумент - это время (старый формат)
+			timeStr = strings.TrimSpace(parts[1])
+			orderCount = 0
+		}
+	} else {
+		// Только 2 аргумента: coin и time
+		timeStr = strings.TrimSpace(parts[1])
+		orderCount = 0
+	}
 
 	// Парсим время
 	duration, err := parseTime(timeStr)
@@ -699,12 +791,12 @@ func (b *Bot) handleAddLimitCommand(update tgbotapi.Update) {
 		return
 	}
 
-	// Проверяем, существует ли уже лимит для этой монеты
+	// Проверяем, существует ли уже лимит для этой монеты и количества ордеров
 	for i, limit := range storage.Limits {
-		if strings.ToUpper(limit.Coin) == coin {
+		if strings.ToUpper(limit.Coin) == coin && limit.OrderCount == orderCount {
 			// Обновляем существующий лимит
 			storage.Limits[i].Time = timeStr
-			log.Printf("[DEBUG] Обновлен лимит для %s: %s", coin, timeStr)
+			log.Printf("[DEBUG] Обновлен лимит для %s (o%d): %s", coin, orderCount, timeStr)
 
 			if err := b.saveLimits(storage); err != nil {
 				log.Printf("[ERROR] Ошибка при сохранении лимитов: %v", err)
@@ -714,9 +806,13 @@ func (b *Bot) handleAddLimitCommand(update tgbotapi.Update) {
 				return
 			}
 
+			var orderInfo string
+			if orderCount > 0 {
+				orderInfo = fmt.Sprintf(" (для o%d)", orderCount)
+			}
 			msg := tgbotapi.NewMessage(update.Message.Chat.ID,
-				fmt.Sprintf("✅ Лимит для %s обновлен: %s (%.0f минут)",
-					coin, timeStr, duration.Minutes()))
+				fmt.Sprintf("✅ Лимит для %s%s обновлен: %s (%.0f минут)",
+					coin, orderInfo, timeStr, duration.Minutes()))
 			b.telegramBot.Send(msg)
 			return
 		}
@@ -724,8 +820,9 @@ func (b *Bot) handleAddLimitCommand(update tgbotapi.Update) {
 
 	// Добавляем новый лимит
 	newLimit := Limit{
-		Coin: coin,
-		Time: timeStr,
+		Coin:       coin,
+		Time:       timeStr,
+		OrderCount: orderCount,
 	}
 	storage.Limits = append(storage.Limits, newLimit)
 
@@ -738,12 +835,16 @@ func (b *Bot) handleAddLimitCommand(update tgbotapi.Update) {
 		return
 	}
 
-	log.Printf("[INFO] Добавлен новый лимит: %s - %s", coin, timeStr)
+	var orderInfo string
+	if orderCount > 0 {
+		orderInfo = fmt.Sprintf(" для o%d", orderCount)
+	}
+	log.Printf("[INFO] Добавлен новый лимит: %s%s - %s", coin, orderInfo, timeStr)
 	msg := tgbotapi.NewMessage(update.Message.Chat.ID,
 		fmt.Sprintf("✅ Лимит добавлен:\n\n"+
-			"Монета: %s\n"+
+			"Монета: %s%s\n"+
 			"Время: %s (%.0f минут)",
-			coin, timeStr, duration.Minutes()))
+			coin, orderInfo, timeStr, duration.Minutes()))
 	b.telegramBot.Send(msg)
 }
 
@@ -767,37 +868,64 @@ func (b *Bot) handleLimitsCommand(update tgbotapi.Update) {
 		msg := tgbotapi.NewMessage(update.Message.Chat.ID,
 			"📋 Установленных лимитов нет.\n\n"+
 				"Используйте команду /add_limit для добавления лимитов.\n\n"+
-				"Пример: /add_limit LSK 12h")
+				"Примеры:\n"+
+				"/l LSK 12h - общий лимит\n"+
+				"/l LSK o1 6h - лимит для 1-го ордера\n"+
+				"/l LSK o2 12h - лимит для 2-го ордера")
 		b.telegramBot.Send(msg)
 		return
+	}
+
+	// Группируем лимиты по монетам для красивого отображения
+	coinLimits := make(map[string][]Limit)
+	var coinOrder []string // Сохраняем порядок монет
+	for _, limit := range storage.Limits {
+		coinUpper := strings.ToUpper(limit.Coin)
+		if _, exists := coinLimits[coinUpper]; !exists {
+			coinOrder = append(coinOrder, coinUpper)
+		}
+		coinLimits[coinUpper] = append(coinLimits[coinUpper], limit)
 	}
 
 	// Формируем сообщение со списком лимитов
 	message := "📋 Установленные лимиты:\n\n"
 
-	for i, limit := range storage.Limits {
-		// Парсим время для отображения в минутах
-		duration, err := parseTime(limit.Time)
-		var timeDisplay string
-		if err != nil {
-			timeDisplay = limit.Time
-		} else {
-			minutes := duration.Minutes()
-			if minutes < 60 {
-				timeDisplay = fmt.Sprintf("%s (%.0f мин)", limit.Time, minutes)
-			} else if minutes < 1440 {
-				hours := minutes / 60
-				timeDisplay = fmt.Sprintf("%s (%.1f ч)", limit.Time, hours)
+	num := 1
+	for _, coin := range coinOrder {
+		limits := coinLimits[coin]
+		message += fmt.Sprintf("%d. %s:\n", num, coin)
+
+		for _, limit := range limits {
+			// Парсим время для отображения
+			duration, err := parseTime(limit.Time)
+			var timeDisplay string
+			if err != nil {
+				timeDisplay = limit.Time
 			} else {
-				days := minutes / 1440
-				timeDisplay = fmt.Sprintf("%s (%.1f дн)", limit.Time, days)
+				minutes := duration.Minutes()
+				if minutes < 60 {
+					timeDisplay = fmt.Sprintf("%s (%.0f мин)", limit.Time, minutes)
+				} else if minutes < 1440 {
+					hours := minutes / 60
+					timeDisplay = fmt.Sprintf("%s (%.1f ч)", limit.Time, hours)
+				} else {
+					days := minutes / 1440
+					timeDisplay = fmt.Sprintf("%s (%.1f дн)", limit.Time, days)
+				}
+			}
+
+			// Формируем строку с учетом типа лимита
+			if limit.OrderCount > 0 {
+				message += fmt.Sprintf("   • o%d: %s\n", limit.OrderCount, timeDisplay)
+			} else {
+				message += fmt.Sprintf("   • общий: %s\n", timeDisplay)
 			}
 		}
-
-		message += fmt.Sprintf("%d. %s - %s\n", i+1, limit.Coin, timeDisplay)
+		num++
 	}
 
-	message += "\n💡 Используйте /add_limit для добавления или изменения лимитов."
+	message += "\n💡 Используйте /l для добавления или изменения лимитов."
+	message += "\nПримеры: /l LSK 12h, /l LSK o1 6h, /l LSK o2 12h"
 
 	// Добавляем информацию об интервале проверки
 	checkInterval := storage.CheckInterval
@@ -891,6 +1019,16 @@ func (b *Bot) handleSetCheckIntervalCommand(update tgbotapi.Update) {
 	b.telegramBot.Send(msg)
 }
 
+// positionLimitInfo хранит информацию о превышенном лимите для позиции
+type positionLimitInfo struct {
+	Position        *futures.PositionRisk
+	FilledOrders    int
+	OpenTime        int64
+	LimitDuration   time.Duration
+	LimitTimeStr    string
+	LimitOrderCount int
+}
+
 // checkPositionsForLimits проверяет открытые позиции на превышение лимитов
 func (b *Bot) checkPositionsForLimits() {
 	if b.chatID == 0 {
@@ -927,33 +1065,27 @@ func (b *Bot) checkPositionsForLimits() {
 		return
 	}
 
-	// Создаем карту лимитов для быстрого поиска
-	limitsMap := make(map[string]time.Duration)
-	for _, limit := range storage.Limits {
-		duration, err := parseTime(limit.Time)
-		if err != nil {
-			log.Printf("[WARN] Не удалось распарсить лимит для %s: %v", limit.Coin, err)
-			continue
-		}
-		limitsMap[strings.ToUpper(limit.Coin)] = duration
-	}
-
 	// Создаем карту текущих открытых позиций для очистки notifiedPositions
 	currentPositions := make(map[string]bool)
 	for _, pos := range positions {
 		currentPositions[pos.Symbol] = true
 	}
 
-	// Очищаем notifiedPositions от закрытых позиций
-	for symbol := range b.notifiedPositions {
+	// Очищаем notifiedPositions от закрытых позиций (только базовый символ)
+	for key := range b.notifiedPositions {
+		// Извлекаем символ из ключа (формат: "SYMBOL" или "SYMBOL_oN")
+		symbol := key
+		if idx := strings.Index(key, "_o"); idx > 0 {
+			symbol = key[:idx]
+		}
 		if !currentPositions[symbol] {
-			log.Printf("[DEBUG] Удаляю %s из уведомленных позиций (позиция закрыта)", symbol)
-			delete(b.notifiedPositions, symbol)
+			log.Printf("[DEBUG] Удаляю %s из уведомленных позиций (позиция закрыта)", key)
+			delete(b.notifiedPositions, key)
 		}
 	}
 
 	// Проверяем каждую позицию
-	var exceededPositions []*futures.PositionRisk
+	var exceededPositions []positionLimitInfo
 	for _, pos := range positions {
 		// Извлекаем базовую монету из символа (например, BTCUSDT -> BTC)
 		symbol := pos.Symbol
@@ -969,14 +1101,6 @@ func (b *Bot) checkPositionsForLimits() {
 			}
 		}
 
-		coinUpper := strings.ToUpper(coin)
-		limitDuration, exists := limitsMap[coinUpper]
-
-		if !exists {
-			log.Printf("[DEBUG] Лимит для %s (%s) не найден, пропускаю", symbol, coinUpper)
-			continue
-		}
-
 		// Определяем направление позиции
 		isLong := true
 		if len(pos.PositionAmt) > 0 && pos.PositionAmt[0] == '-' {
@@ -990,43 +1114,75 @@ func (b *Bot) checkPositionsForLimits() {
 			continue
 		}
 
+		// Получаем количество исполненных ордеров
+		filledOrdersCount, err := b.getFilledOrdersCount(symbol, openTime)
+		if err != nil {
+			log.Printf("[WARN] Не удалось получить количество ордеров для %s: %v", symbol, err)
+			filledOrdersCount = 0
+		}
+
+		// Используем функцию для выбора лимита с учетом количества ордеров
+		limitDuration, limitTimeStr, limitOrderCount, hasLimit := getLimitForPosition(storage.Limits, coin, filledOrdersCount)
+
+		if !hasLimit {
+			log.Printf("[DEBUG] Лимит для %s (%s) не найден, пропускаю", symbol, coin)
+			continue
+		}
+
 		// Вычисляем время жизни позиции
 		now := time.Now().UnixMilli()
 		positionAge := time.Duration(now-openTime) * time.Millisecond
 
+		// Создаем уникальный ключ для уведомлений (учитывая количество ордеров)
+		notifyKey := symbol
+		if limitOrderCount > 0 {
+			notifyKey = fmt.Sprintf("%s_o%d", symbol, limitOrderCount)
+		}
+
 		// Проверяем, превышает ли время жизни лимит
 		if positionAge > limitDuration {
-			// Проверяем, было ли уже отправлено уведомление для этой позиции
-			if b.notifiedPositions[symbol] {
-				log.Printf("[DEBUG] Позиция %s превышает лимит, но уведомление уже было отправлено", symbol)
+			// Проверяем, было ли уже отправлено уведомление для этой позиции и лимита
+			if b.notifiedPositions[notifyKey] {
+				log.Printf("[DEBUG] Позиция %s (лимит o%d) превышает лимит, но уведомление уже было отправлено", symbol, limitOrderCount)
 				continue
 			}
-			log.Printf("[INFO] Позиция %s превысила лимит: возраст %v, лимит %v",
-				symbol, positionAge, limitDuration)
-			exceededPositions = append(exceededPositions, pos)
+			log.Printf("[INFO] Позиция %s превысила лимит (o%d): возраст %v, лимит %v",
+				symbol, limitOrderCount, positionAge, limitDuration)
+			exceededPositions = append(exceededPositions, positionLimitInfo{
+				Position:        pos,
+				FilledOrders:    filledOrdersCount,
+				OpenTime:        openTime,
+				LimitDuration:   limitDuration,
+				LimitTimeStr:    limitTimeStr,
+				LimitOrderCount: limitOrderCount,
+			})
 		} else {
 			// Если позиция вернулась в пределы лимита, удаляем из уведомленных
-			if b.notifiedPositions[symbol] {
-				log.Printf("[DEBUG] Позиция %s вернулась в пределы лимита, сбрасываю флаг уведомления", symbol)
-				delete(b.notifiedPositions, symbol)
+			if b.notifiedPositions[notifyKey] {
+				log.Printf("[DEBUG] Позиция %s (лимит o%d) вернулась в пределы лимита, сбрасываю флаг уведомления", symbol, limitOrderCount)
+				delete(b.notifiedPositions, notifyKey)
 			}
 		}
 	}
 
 	// Отправляем уведомления о позициях, превысивших лимит
 	if len(exceededPositions) > 0 {
-		b.sendLimitExceededNotifications(exceededPositions, storage)
+		b.sendLimitExceededNotificationsV2(exceededPositions)
 		// Отмечаем позиции как уведомленные
-		for _, pos := range exceededPositions {
-			b.notifiedPositions[pos.Symbol] = true
-			log.Printf("[DEBUG] Позиция %s отмечена как уведомленная", pos.Symbol)
+		for _, info := range exceededPositions {
+			notifyKey := info.Position.Symbol
+			if info.LimitOrderCount > 0 {
+				notifyKey = fmt.Sprintf("%s_o%d", info.Position.Symbol, info.LimitOrderCount)
+			}
+			b.notifiedPositions[notifyKey] = true
+			log.Printf("[DEBUG] Позиция %s (лимит o%d) отмечена как уведомленная", info.Position.Symbol, info.LimitOrderCount)
 		}
 	} else {
 		log.Printf("[DEBUG] Все позиции в пределах лимитов или уже уведомлены")
 	}
 }
 
-// sendLimitExceededNotifications отправляет уведомления о позициях, превысивших лимит
+// sendLimitExceededNotifications отправляет уведомления о позициях, превысивших лимит (устаревшая версия)
 func (b *Bot) sendLimitExceededNotifications(positions []*futures.PositionRisk, storage *LimitsStorage) {
 	log.Printf("[INFO] Отправляю уведомления о %d позициях, превысивших лимит", len(positions))
 
@@ -1085,6 +1241,57 @@ func (b *Bot) sendLimitExceededNotifications(positions []*futures.PositionRisk, 
 
 		message += fmt.Sprintf("   Время жизни: %s (лимит: %s)\n", ageStr, limitStr)
 		message += fmt.Sprintf("   ⚠️ Превышение: %v\n\n", positionAge-limitDuration)
+	}
+
+	message += "💡 <i>Рекомендуется закрыть позиции, превысившие лимиты.</i>"
+
+	// Отправляем сообщение
+	err := b.sendLongMessage(b.chatID, message, "HTML")
+	if err != nil {
+		log.Printf("[ERROR] Ошибка при отправке уведомления о превышении лимитов: %v", err)
+	} else {
+		log.Printf("[INFO] Уведомление о превышении лимитов отправлено успешно")
+	}
+}
+
+// sendLimitExceededNotificationsV2 отправляет уведомления о позициях, превысивших лимит (с учетом количества ордеров)
+func (b *Bot) sendLimitExceededNotificationsV2(exceededPositions []positionLimitInfo) {
+	log.Printf("[INFO] Отправляю уведомления о %d позициях, превысивших лимит", len(exceededPositions))
+
+	message := "⚠️ <b>ВНИМАНИЕ: Позиции превысили установленные лимиты!</b>\n\n"
+
+	for _, info := range exceededPositions {
+		pos := info.Position
+
+		// Определяем направление позиции
+		side := "LONG"
+		if len(pos.PositionAmt) > 0 && pos.PositionAmt[0] == '-' {
+			side = "SHORT"
+		}
+
+		// Вычисляем возраст позиции
+		now := time.Now().UnixMilli()
+		positionAge := time.Duration(now-info.OpenTime) * time.Millisecond
+		ageStr := b.formatPositionTime(info.OpenTime)
+
+		// Формируем информацию о типе лимита
+		var limitTypeStr string
+		if info.LimitOrderCount > 0 {
+			limitTypeStr = fmt.Sprintf(" (o%d)", info.LimitOrderCount)
+		}
+
+		message += fmt.Sprintf("🔴 <b>%s %s</b>\n", pos.Symbol, side)
+		message += fmt.Sprintf("   Размер: %s\n", pos.PositionAmt)
+		message += fmt.Sprintf("   Цена входа: %s\n", pos.EntryPrice)
+
+		// Отображаем PnL
+		if pos.UnRealizedProfit != "" && pos.UnRealizedProfit != "0" && pos.UnRealizedProfit != "0.0" {
+			message += fmt.Sprintf("   PnL: %s\n", pos.UnRealizedProfit)
+		}
+
+		message += fmt.Sprintf("   Исполненных ордеров: %d\n", info.FilledOrders)
+		message += fmt.Sprintf("   Время жизни: %s (лимит: %s%s)\n", ageStr, info.LimitTimeStr, limitTypeStr)
+		message += fmt.Sprintf("   ⚠️ Превышение: %v\n\n", positionAge-info.LimitDuration)
 	}
 
 	message += "💡 <i>Рекомендуется закрыть позиции, превысившие лимиты.</i>"
