@@ -347,10 +347,15 @@ func (b *Bot) getFilledOrdersCount(symbol string, positionOpenTime int64) (int, 
 
 // PositionCosts содержит информацию о расходах по позиции
 type PositionCosts struct {
-	TotalCommission float64 // Сумма комиссий (отрицательное значение = расход)
-	TotalFunding    float64 // Сумма фандинга (отрицательное = расход, положительное = доход)
-	TotalCost       float64 // Общая сумма расходов (положительное значение = расход)
+	TotalCommission      float64 // Сумма комиссий (отрицательное значение = расход)
+	TotalFunding         float64 // Сумма фандинга (отрицательное = расход, положительное = доход)
+	TotalCost            float64 // Общая сумма расходов (положительное значение = расход)
+	EstimatedCloseFee    float64 // Предполагаемая комиссия при закрытии рыночным ордером
+	TotalCostWithCloseFee float64 // Общая сумма расходов с учётом комиссии закрытия
 }
+
+// Константа для комиссии тейкера на Binance Futures (VIP 0)
+const TakerFeeRate = 0.0005 // 0.05%
 
 // getPositionIncomeHistory получает историю доходов/расходов для позиции с момента её открытия
 func (b *Bot) getPositionIncomeHistory(symbol string, openTime int64) (*PositionCosts, error) {
@@ -451,11 +456,17 @@ func (b *Bot) calculateBreakevenPrice(pos *futures.PositionRisk, openTime int64)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка получения расходов: %w", err)
 	}
+
+	// Рассчитываем предполагаемую комиссию при закрытии рыночным ордером
+	// Комиссия = |размер позиции| × текущая цена × TakerFeeRate
+	costs.EstimatedCloseFee = info.PositionSize * info.CurrentPrice * TakerFeeRate
+	costs.TotalCostWithCloseFee = costs.TotalCost + costs.EstimatedCloseFee
+
 	info.Costs = costs
 
-	// Рассчитываем цену безубыточности
+	// Рассчитываем цену безубыточности с учётом комиссии закрытия
 	if info.PositionSize > 0 {
-		costPerUnit := costs.TotalCost / info.PositionSize
+		costPerUnit := costs.TotalCostWithCloseFee / info.PositionSize
 		if info.IsLong {
 			// Для LONG: нужно продать выше цены входа на сумму расходов
 			info.BreakevenPrice = entryPrice + costPerUnit
@@ -572,9 +583,9 @@ func (b *Bot) formatPositionsMessage(positions []*futures.PositionRisk) string {
 			}
 			message += fmt.Sprintf("   Безубыток: %s\n", beStatus)
 			// Показываем расходы
-			if beInfo.Costs.TotalCost != 0 {
-				message += fmt.Sprintf("   📊 Комиссия: %.4f, Фандинг: %.4f\n",
-					-beInfo.Costs.TotalCommission, -beInfo.Costs.TotalFunding)
+			if beInfo.Costs.TotalCostWithCloseFee != 0 {
+				message += fmt.Sprintf("   📊 Комиссия закрытия: %.4f, Фандинг: %.4f\n",
+					beInfo.Costs.EstimatedCloseFee, -beInfo.Costs.TotalFunding)
 			}
 		}
 
@@ -1620,9 +1631,9 @@ func (b *Bot) sendBreakevenNotifications(positions []*BreakevenInfo, symbols []s
 		message += fmt.Sprintf("   Цена входа: %.4f\n", info.EntryPrice)
 		message += fmt.Sprintf("   Безубыток: %.4f\n", info.BreakevenPrice)
 		message += fmt.Sprintf("   Текущая цена: %.4f (%.2f%%)\n", info.CurrentPrice, info.DistancePercent)
-		message += fmt.Sprintf("   📊 Комиссия: %.4f USDT\n", -info.Costs.TotalCommission)
+		message += fmt.Sprintf("   📊 Комиссия закрытия: %.4f USDT (%.2f%%)\n", info.Costs.EstimatedCloseFee, TakerFeeRate*100)
 		message += fmt.Sprintf("   📊 Фандинг: %.4f USDT\n", -info.Costs.TotalFunding)
-		message += fmt.Sprintf("   💰 Всего расходов: %.4f USDT\n\n", info.Costs.TotalCost)
+		message += fmt.Sprintf("   💰 Всего расходов: %.4f USDT\n\n", info.Costs.TotalCostWithCloseFee)
 	}
 
 	message += "💡 <i>Позиция достигла уровня, при котором можно закрыться без убытка.</i>"
