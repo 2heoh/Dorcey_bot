@@ -180,16 +180,49 @@ func (b *Bot) formatPositionTime(updateTime int64) string {
 
 // calculatePositionOpenTime вычисляет время открытия текущей позиции по списку ордеров
 // Отслеживает баланс позиции и находит момент последнего открытия
-// (когда позиция перешла из 0 или противоположного направления в текущее)
+// (когда позиция перешла из 0 в ненулевую)
 // isLong: true для LONG позиции, false для SHORT
+// Поддерживает Hedge Mode (раздельные LONG/SHORT позиции)
 func calculatePositionOpenTime(orders []*futures.Order, isLong bool) int64 {
 	if len(orders) == 0 {
 		return 0
 	}
 
+	// Определяем режим: Hedge Mode или One-way Mode
+	// В Hedge Mode все ордера имеют PositionSide == LONG или SHORT
+	// В One-way Mode ордера имеют PositionSide == BOTH или пустой
+	hedgeMode := false
+	for _, order := range orders {
+		if order.PositionSide == futures.PositionSideTypeLong ||
+			order.PositionSide == futures.PositionSideTypeShort {
+			hedgeMode = true
+			break
+		}
+	}
+
+	// Фильтруем ордера по PositionSide для Hedge Mode
+	var filteredOrders []*futures.Order
+	if hedgeMode {
+		targetSide := futures.PositionSideTypeLong
+		if !isLong {
+			targetSide = futures.PositionSideTypeShort
+		}
+		for _, order := range orders {
+			if order.PositionSide == targetSide {
+				filteredOrders = append(filteredOrders, order)
+			}
+		}
+	} else {
+		filteredOrders = orders
+	}
+
+	if len(filteredOrders) == 0 {
+		return 0
+	}
+
 	// Сортируем ордера по времени (от старых к новым)
-	sortedOrders := make([]*futures.Order, len(orders))
-	copy(sortedOrders, orders)
+	sortedOrders := make([]*futures.Order, len(filteredOrders))
+	copy(sortedOrders, filteredOrders)
 	for i := 0; i < len(sortedOrders)-1; i++ {
 		for j := i + 1; j < len(sortedOrders); j++ {
 			timeI := sortedOrders[i].Time
@@ -206,8 +239,7 @@ func calculatePositionOpenTime(orders []*futures.Order, isLong bool) int64 {
 		}
 	}
 
-	// Отслеживаем баланс позиции
-	// Положительный баланс = LONG, отрицательный = SHORT
+	// Отслеживаем баланс позиции (всегда >= 0 в Hedge Mode для одной стороны)
 	var positionBalance float64 = 0
 	var lastOpenTime int64 = 0
 
@@ -229,29 +261,64 @@ func calculatePositionOpenTime(orders []*futures.Order, isLong bool) int64 {
 
 		prevBalance := positionBalance
 
-		// BUY увеличивает позицию, SELL уменьшает
-		if order.Side == futures.SideTypeBuy {
-			positionBalance += executedQty
+		if hedgeMode {
+			// В Hedge Mode для LONG позиции:
+			// - BUY увеличивает LONG позицию
+			// - SELL уменьшает LONG позицию
+			// Для SHORT позиции:
+			// - SELL увеличивает SHORT позицию
+			// - BUY уменьшает SHORT позицию
+			if isLong {
+				if order.Side == futures.SideTypeBuy {
+					positionBalance += executedQty
+				} else {
+					positionBalance -= executedQty
+				}
+			} else {
+				if order.Side == futures.SideTypeSell {
+					positionBalance += executedQty
+				} else {
+					positionBalance -= executedQty
+				}
+			}
 		} else {
-			positionBalance -= executedQty
+			// В One-way Mode: BUY = +, SELL = -
+			if order.Side == futures.SideTypeBuy {
+				positionBalance += executedQty
+			} else {
+				positionBalance -= executedQty
+			}
 		}
 
-		// Определяем направление позиции до и после ордера
-		wasLong := prevBalance > 0.0000001 // Небольшой порог для float сравнения
-		wasShort := prevBalance < -0.0000001
-		wasZero := !wasLong && !wasShort
+		// Ограничиваем баланс неотрицательным значением для Hedge Mode
+		if hedgeMode && positionBalance < 0 {
+			positionBalance = 0
+		}
 
-		nowLong := positionBalance > 0.0000001
-		nowShort := positionBalance < -0.0000001
-
-		// Позиция открылась, если:
-		// 1. Была нулевой и стала ненулевой в нужном направлении
-		// 2. Была в противоположном направлении и стала в нужном
+		// Определяем, открылась ли позиция
 		positionOpened := false
-		if isLong {
-			positionOpened = nowLong && (wasZero || wasShort)
+		if hedgeMode {
+			// В Hedge Mode: позиция открылась, если была нулевой и стала ненулевой
+			wasZero := prevBalance < 0.0000001
+			nowOpen := positionBalance > 0.0000001
+			positionOpened = wasZero && nowOpen
 		} else {
-			positionOpened = nowShort && (wasZero || wasLong)
+			// В One-way Mode: используем старую логику с направлениями
+			wasLong := prevBalance > 0.0000001
+			wasShort := prevBalance < -0.0000001
+			wasZero := !wasLong && !wasShort
+
+			nowLong := positionBalance > 0.0000001
+			nowShort := positionBalance < -0.0000001
+
+			// Позиция открылась, если:
+			// 1. Была нулевой и стала ненулевой в нужном направлении
+			// 2. Была в противоположном направлении и стала в нужном
+			if isLong {
+				positionOpened = nowLong && (wasZero || wasShort)
+			} else {
+				positionOpened = nowShort && (wasZero || wasLong)
+			}
 		}
 
 		if positionOpened {
@@ -306,15 +373,53 @@ func (b *Bot) getPositionOpenTime(symbol string, isLong bool) (int64, error) {
 }
 
 // calculateFilledOrdersCount подсчитывает исполненные ордера после времени открытия позиции
-func calculateFilledOrdersCount(orders []*futures.Order, positionOpenTime int64) int {
+// Считает только ордера, которые увеличивают позицию (BUY для LONG, SELL для SHORT)
+// isLong: true для LONG позиции, false для SHORT
+func calculateFilledOrdersCount(orders []*futures.Order, positionOpenTime int64, isLong bool) int {
+	// Определяем режим: Hedge Mode или One-way Mode
+	hedgeMode := false
+	for _, order := range orders {
+		if order.PositionSide == futures.PositionSideTypeLong ||
+			order.PositionSide == futures.PositionSideTypeShort {
+			hedgeMode = true
+			break
+		}
+	}
+
 	filledCount := 0
 	for _, order := range orders {
-		if order.Status == futures.OrderStatusTypeFilled {
-			orderTime := order.Time
-			if orderTime == 0 {
-				orderTime = order.UpdateTime
+		if order.Status != futures.OrderStatusTypeFilled {
+			continue
+		}
+
+		orderTime := order.Time
+		if orderTime == 0 {
+			orderTime = order.UpdateTime
+		}
+		if orderTime < positionOpenTime {
+			continue
+		}
+
+		if hedgeMode {
+			// В Hedge Mode: фильтруем по PositionSide и считаем только открывающие ордера
+			targetSide := futures.PositionSideTypeLong
+			if !isLong {
+				targetSide = futures.PositionSideTypeShort
 			}
-			if orderTime >= positionOpenTime {
+			if order.PositionSide != targetSide {
+				continue
+			}
+			// Для LONG считаем только BUY, для SHORT только SELL
+			if isLong && order.Side == futures.SideTypeBuy {
+				filledCount++
+			} else if !isLong && order.Side == futures.SideTypeSell {
+				filledCount++
+			}
+		} else {
+			// В One-way Mode: для LONG считаем BUY, для SHORT считаем SELL
+			if isLong && order.Side == futures.SideTypeBuy {
+				filledCount++
+			} else if !isLong && order.Side == futures.SideTypeSell {
 				filledCount++
 			}
 		}
@@ -324,10 +429,11 @@ func calculateFilledOrdersCount(orders []*futures.Order, positionOpenTime int64)
 
 // getFilledOrdersCount получает количество исполненных ордеров для символа
 // учитывая только ордера, открытые после времени открытия позиции
-func (b *Bot) getFilledOrdersCount(symbol string, positionOpenTime int64) (int, error) {
+// isLong: true для LONG позиции, false для SHORT
+func (b *Bot) getFilledOrdersCount(symbol string, positionOpenTime int64, isLong bool) (int, error) {
 	ctx := context.Background()
 
-	log.Printf("[DEBUG] Получаю количество исполненных ордеров для %s (после времени открытия: %d)...", symbol, positionOpenTime)
+	log.Printf("[DEBUG] Получаю количество исполненных ордеров для %s (после времени открытия: %d, isLong: %v)...", symbol, positionOpenTime, isLong)
 
 	// Получаем все ордера (максимум 1000 для Binance Futures API)
 	orders, err := b.binanceClient.NewListOrdersService().
@@ -340,7 +446,7 @@ func (b *Bot) getFilledOrdersCount(symbol string, positionOpenTime int64) (int, 
 		return 0, err
 	}
 
-	filledCount := calculateFilledOrdersCount(orders, positionOpenTime)
+	filledCount := calculateFilledOrdersCount(orders, positionOpenTime, isLong)
 	log.Printf("[DEBUG] Найдено исполненных ордеров для %s (после открытия позиции): %d из %d", symbol, filledCount, len(orders))
 	return filledCount, nil
 }
@@ -524,14 +630,14 @@ func (b *Bot) formatPositionsMessage(positions []*futures.PositionRisk) string {
 		timeStr := b.formatPositionTime(openTime)
 
 		// Получаем количество исполненных ордеров (только после времени открытия позиции)
-		filledOrdersCount, err := b.getFilledOrdersCount(pos.Symbol, openTime)
+		filledOrdersCount, err := b.getFilledOrdersCount(pos.Symbol, openTime, isLong)
 		if err != nil {
 			log.Printf("[WARN] Не удалось получить количество исполненных ордеров для %s: %v", pos.Symbol, err)
 			filledOrdersCount = 0
 		}
 
 		side := "LONG"
-		if len(pos.PositionAmt) > 0 && pos.PositionAmt[0] == '-' {
+		if !isLong {
 			side = "SHORT"
 		}
 
@@ -1377,7 +1483,7 @@ func (b *Bot) checkPositionsForLimits() {
 		}
 
 		// Получаем количество исполненных ордеров
-		filledOrdersCount, err := b.getFilledOrdersCount(symbol, openTime)
+		filledOrdersCount, err := b.getFilledOrdersCount(symbol, openTime, isLong)
 		if err != nil {
 			log.Printf("[WARN] Не удалось получить количество ордеров для %s: %v", symbol, err)
 			filledOrdersCount = 0
